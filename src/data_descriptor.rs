@@ -23,6 +23,8 @@
 //! ciphertext (with a Poly1305 tag) or opaque plaintext bytes. `CalcFlags`
 //! at `vdxf.h:1101-1111` reads: `(flags & FLAG_ENCRYPTED_DATA) + ...`.
 
+use crate::crypto::aead_encrypt;
+use crate::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
 use crate::wire::{write_limited_string, write_var_bytes, write_varint_u64, WireError};
 
 /// Default and only supported `CDataDescriptor` version. `vdxf.h:951`.
@@ -162,6 +164,58 @@ pub fn write_data_descriptor(
         write_var_bytes(buf, dd.ssk.expect("guarded by flag bit"));
     }
     Ok(())
+}
+
+/// Output of [`wrap_encrypted_with_key`] — the two byte fields the caller
+/// needs to populate on the outer `DataDescriptor`.
+#[derive(Debug, Clone)]
+pub struct WrappedEncrypted {
+    /// AEAD ciphertext (plaintext + 16-byte Poly1305 tag). Becomes
+    /// `outer.object_data`.
+    pub object_data: Vec<u8>,
+    /// The Sapling ephemeral public key that decrypts `object_data` (when
+    /// combined with a valid `ivk`). Becomes `outer.epk`.
+    pub epk: [u8; 32],
+}
+
+/// Compose the daemon's `CDataDescriptor::WrapEncrypted`
+/// (`vdxf.h:1050-1064`): serialize `inner`, wrap in a
+/// `CVDXF_Data(DataDescriptorKey, ...)` envelope, and AEAD-encrypt the whole
+/// thing with `symmetric_key`.
+///
+/// This is the low-level primitive. The caller supplies the derived
+/// symmetric key `K` (= `KDF_Sapling(dhsecret, epk)`) and the matching
+/// ephemeral public key `epk`. The daemon derives both from a fresh random
+/// `esk` and the recipient `SaplingPaymentAddress`
+/// (`vdxf.cpp:614-656`); the higher-level API that does that end-to-end
+/// derivation is deferred until the ephemeral-key module lands.
+///
+/// The caller then constructs the outer `DataDescriptor` themselves,
+/// filling `encrypted: true`, `object_data`, and `epk` from the returned
+/// value and optionally adding `ivk` (turning `flags:5` into `flags:13`).
+pub fn wrap_encrypted_with_key(
+    inner: &DataDescriptor<'_>,
+    symmetric_key: &[u8; 32],
+    epk: &[u8; 32],
+) -> Result<WrappedEncrypted, WireError> {
+    // 1. Serialize the inner CDataDescriptor.
+    let mut inner_bytes = Vec::new();
+    write_data_descriptor(&mut inner_bytes, inner)?;
+
+    // 2. Wrap it in CVDXF_Data(DataDescriptorKey, inner_bytes). This is the
+    //    plaintext handed to AEAD encrypt. It matches nestedObject at
+    //    vdxf.h:1053.
+    let mut plaintext = Vec::new();
+    write_cvdxf_data(&mut plaintext, &DATA_DESCRIPTOR_KEY_LE, 1, &inner_bytes);
+
+    // 3. AEAD-encrypt. Zero nonce is safe because K is derived from a fresh
+    //    esk per call; see the daemon comment at vdxf.cpp:564.
+    let ciphertext = aead_encrypt(symmetric_key, &plaintext);
+
+    Ok(WrappedEncrypted {
+        object_data: ciphertext,
+        epk: *epk,
+    })
 }
 
 fn is_nonempty_str(s: Option<&str>) -> bool {
@@ -376,6 +430,57 @@ mod tests {
             err,
             WireError::LimitedStringTooLong { cap: 128, actual: 129 }
         );
+    }
+
+    #[test]
+    fn wrap_encrypted_with_key_produces_deterministic_ciphertext_for_pinned_inputs() {
+        // Fixed K + epk + inner descriptor → deterministic ciphertext, since
+        // AEAD uses a zero nonce and encryption is a pure function of (K, plaintext).
+        let inner = DataDescriptor::new(&[0x11, 0x22, 0x33]);
+        let k = [0x55u8; 32];
+        let epk = [0x77u8; 32];
+
+        let a = wrap_encrypted_with_key(&inner, &k, &epk).unwrap();
+        let b = wrap_encrypted_with_key(&inner, &k, &epk).unwrap();
+        assert_eq!(a.object_data, b.object_data);
+        assert_eq!(a.epk, epk);
+    }
+
+    #[test]
+    fn wrap_encrypted_output_decrypts_back_to_the_cvdxf_wrapped_inner_bytes() {
+        use crate::crypto::aead_decrypt;
+
+        let inner = DataDescriptor::new(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let k = [0x99u8; 32];
+        let epk = [0x88u8; 32];
+
+        let wrapped = wrap_encrypted_with_key(&inner, &k, &epk).unwrap();
+        let plaintext = aead_decrypt(&k, &wrapped.object_data).unwrap();
+
+        // The plaintext is: CVDXF_Data header (20B key + 1B VARINT version=1
+        // + 1B CompactSize length = 22B) followed by the serialized inner.
+        // Inner serialization is: VARINT(1) VARINT(0) CompactSize(4) + 4B
+        // objectData = 7 bytes.
+        assert_eq!(&plaintext[..20], &DATA_DESCRIPTOR_KEY_LE);
+        assert_eq!(plaintext[20], 0x01);
+        assert_eq!(plaintext[21], 0x07, "inner descriptor is 7 bytes");
+        assert_eq!(&plaintext[22..], &[0x01, 0x00, 0x04, 0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn wrap_encrypted_output_length_is_inner_serialized_plus_22_plus_16() {
+        // Overhead accounting: 20B CVDXF key + 1B VARINT version + 1B
+        // CompactSize length (small payloads) + inner descriptor bytes +
+        // 16B Poly1305 tag.
+        let inner = DataDescriptor::new(&[0x00; 40]);
+        let k = [0x01u8; 32];
+        let epk = [0x02u8; 32];
+
+        let wrapped = wrap_encrypted_with_key(&inner, &k, &epk).unwrap();
+        // Inner serialized: VARINT(1) VARINT(0) CompactSize(40) + 40B = 43B
+        // Plaintext: 22B header + 43B inner = 65B
+        // Ciphertext: 65B + 16B tag = 81B
+        assert_eq!(wrapped.object_data.len(), 81);
     }
 
     #[test]

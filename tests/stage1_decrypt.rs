@@ -8,7 +8,9 @@
 //! `chainvue-things/flags13-writer-lib/scoping/byte-parity-experiment/`.
 
 use verusid_cmm_encrypt::crypto::{aead_decrypt, kdf_sapling, sapling_ka_agree};
-use verusid_cmm_encrypt::data_descriptor::{write_data_descriptor, DataDescriptor};
+use verusid_cmm_encrypt::data_descriptor::{
+    wrap_encrypted_with_key, write_data_descriptor, DataDescriptor,
+};
 use verusid_cmm_encrypt::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
 
 /// `DataDescriptorKey` i-address (`i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv`)
@@ -133,6 +135,61 @@ fn data_descriptor_reserializes_the_stage1_inner_byte_for_byte() {
     )
     .unwrap();
     assert_eq!(reserialized, inner_ddesc);
+}
+
+/// End-to-end encrypt-side byte-parity milestone.
+///
+/// Given the daemon-written outer descriptor from the fixture, reconstruct
+/// the inputs that produced it (the inner `CDataDescriptor` and the
+/// symmetric key `K`) and re-encrypt through `wrap_encrypted_with_key`.
+/// The output must equal the fixture's `objectdata` byte-for-byte.
+///
+/// This is the first encrypt-side check that exercises the full stack:
+/// wire helpers + `CDataDescriptor` serialization + `CVDXF_Data` wrapping +
+/// AEAD encryption. Any drift in any layer breaks the assertion.
+///
+/// We can compute `K` without knowing the daemon's `esk` because Sapling
+/// KA agreement is symmetric: `esk * pk_d.mul_by_cofactor()` (encrypt)
+/// equals `ivk * epk.mul_by_cofactor()` (decrypt), and `K` = KDF(that, epk)
+/// either way.
+#[test]
+fn wrap_encrypted_reproduces_fixture_ciphertext_byte_for_byte() {
+    let raw = include_str!("fixtures/t1_578528.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let outer = &fixture["outerDescriptor"];
+
+    let ivk = hex_to_32(outer["ivk"].as_str().unwrap());
+    let epk = hex_to_32(outer["epk"].as_str().unwrap());
+    let ciphertext = hex::decode(outer["objectdata"].as_str().unwrap()).unwrap();
+
+    // Derive K via the decrypt-side agreement (already proven byte-parity).
+    let dhsecret = sapling_ka_agree(&ivk, &epk).unwrap();
+    let k = kdf_sapling(&dhsecret, &epk);
+
+    // Decrypt to recover the CVDXF_Data-wrapped inner descriptor, then
+    // extract the inner's raw fields so we can reconstruct it as a
+    // `DataDescriptor` and re-encrypt.
+    let plaintext = aead_decrypt(&k, &ciphertext).unwrap();
+    let inner_bytes = &plaintext[22..];
+    // The fixture's inner is version=1, flags=0, small objectData.
+    assert_eq!(inner_bytes[0], 0x01);
+    assert_eq!(inner_bytes[1], 0x00);
+    assert!(inner_bytes[2] < 0xFD);
+    let object_data_len = usize::from(inner_bytes[2]);
+    let object_data = &inner_bytes[3..3 + object_data_len];
+
+    let inner_dd = DataDescriptor {
+        object_data,
+        version: 1,
+        ..Default::default()
+    };
+
+    let wrapped = wrap_encrypted_with_key(&inner_dd, &k, &epk).unwrap();
+    assert_eq!(
+        wrapped.object_data, ciphertext,
+        "encrypt-side output must match daemon's ciphertext byte-for-byte"
+    );
+    assert_eq!(wrapped.epk, epk);
 }
 
 fn hex_to_32(s: &str) -> [u8; 32] {
