@@ -8,6 +8,7 @@
 //! `chainvue-things/flags13-writer-lib/scoping/byte-parity-experiment/`.
 
 use verusid_cmm_encrypt::crypto::{aead_decrypt, kdf_sapling, sapling_ka_agree};
+use verusid_cmm_encrypt::data_descriptor::{write_data_descriptor, DataDescriptor};
 use verusid_cmm_encrypt::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
 
 /// `DataDescriptorKey` i-address (`i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv`)
@@ -89,6 +90,49 @@ fn cvdxf_data_reserializes_the_stage1_plaintext_byte_for_byte() {
     let mut reserialized = Vec::new();
     write_cvdxf_data(&mut reserialized, &DATA_DESCRIPTOR_KEY_LE, 1, inner);
     assert_eq!(reserialized, plaintext);
+}
+
+/// The 66 inner bytes of the stage-1 plaintext (everything after the
+/// `CVDXF_Data` header) are themselves a serialized `CDataDescriptor`.
+/// Parse its version + flags + objectData framing, then hand the objectData
+/// back to `write_data_descriptor` and assert we reproduce the full inner.
+#[test]
+fn data_descriptor_reserializes_the_stage1_inner_byte_for_byte() {
+    let raw = include_str!("fixtures/t1_578528.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let outer = &fixture["outerDescriptor"];
+
+    let ivk = hex_to_32(outer["ivk"].as_str().unwrap());
+    let epk = hex_to_32(outer["epk"].as_str().unwrap());
+    let ciphertext = hex::decode(outer["objectdata"].as_str().unwrap()).unwrap();
+    let dhsecret = sapling_ka_agree(&ivk, &epk).unwrap();
+    let key = kdf_sapling(&dhsecret, &epk);
+    let plaintext = aead_decrypt(&key, &ciphertext).unwrap();
+
+    // Peel off the 22-byte CVDXF_Data header (20B key + VARINT + CompactSize).
+    let inner_ddesc = &plaintext[22..];
+
+    // Parse the inner as a bare CDataDescriptor. For this fixture it is
+    // version=1, flags=0 (plaintext), object_data = the trailing bytes.
+    assert_eq!(inner_ddesc[0], 0x01, "inner VARINT version = 1");
+    assert_eq!(inner_ddesc[1], 0x00, "inner VARINT flags = 0 (plaintext CCDR pointer)");
+    // Byte 2 is CompactSize length of objectData; must fit in single byte for this fixture.
+    assert!(inner_ddesc[2] < 0xFD);
+    let object_data_len = usize::from(inner_ddesc[2]);
+    assert_eq!(
+        3 + object_data_len,
+        inner_ddesc.len(),
+        "flags=0 inner has no trailing optional fields"
+    );
+    let object_data = &inner_ddesc[3..];
+
+    let mut reserialized = Vec::new();
+    write_data_descriptor(
+        &mut reserialized,
+        &DataDescriptor::new(object_data),
+    )
+    .unwrap();
+    assert_eq!(reserialized, inner_ddesc);
 }
 
 fn hex_to_32(s: &str) -> [u8; 32] {
