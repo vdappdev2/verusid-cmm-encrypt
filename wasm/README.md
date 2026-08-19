@@ -5,7 +5,7 @@ Verus identity content-multimap entries in the `flags:13` public-decrypt
 envelope shape.
 
 Bytes-in / bytes-out. No wallet, no tx builder, no RPC. Callers compose the
-returned `cmmEntry` and `dataDepositOutputScript` into an `updateidentity`
+returned `cmmEntry` and `dataDepositOutputScripts` into an `updateidentity`
 transaction using whatever signing stack they already have.
 
 ## Build
@@ -16,7 +16,7 @@ wasm-pack build --target nodejs   # or --target web / --target bundler
 ```
 
 Produces a JS/TS package under `pkg/` (or `--out-dir` if overridden). The
-default `--out-dir` is `pkg/`; the smoke test builds into `tests/node/pkg/`.
+smoke test builds into `tests/node/pkg/`.
 
 ## JS usage
 
@@ -24,23 +24,34 @@ default `--out-dir` is `pkg/`; the smoke test builds into `tests/node/pkg/`.
 import { encryptPublicDecrypt } from "verusid-cmm-encrypt-wasm";
 
 const result = encryptPublicDecrypt(
-  plaintextBytes,       // Uint8Array
-  outerVdxfKey,         // Uint8Array, exactly 20 bytes (LE from getvdxfid)
-  systemId,             // Uint8Array, exactly 20 bytes (LE ASSETCHAINS_CHAINID)
-  label,                // string | null
-  mimeType,             // string | null
-  dataDepositVoutIndex, // number, u32 — index the deposit output will occupy
+  plaintextBytes,        // Uint8Array
+  outerVdxfKey,          // Uint8Array, exactly 20 bytes (LE from getvdxfid)
+  systemId,              // Uint8Array, exactly 20 bytes (LE ASSETCHAINS_CHAINID)
+  label,                 // string | null
+  mimeType,              // string | null
+  dataDepositVoutIndex,  // number, u32 — index the first deposit output will occupy
+  signature,             // Uint8Array | null — optional caller-supplied signature
+                         //   to attach as a second cmm descriptor
 );
 
 // {
 //   cmmEntry: { vdxfKey: Uint8Array, value: Uint8Array },
-//   dataDepositOutputScript: Uint8Array,   // full scriptPubKey, value=0 output
-//   publishedIvk: Uint8Array,              // anyone holding this can decrypt
+//   dataDepositOutputScripts: Array<Uint8Array>,   // 1 element normally; N
+//                                                  // when payload triggers
+//                                                  // BreakApart chunking
+//   publishedIvk: Uint8Array,                      // one key decrypts data
+//                                                  // AND signature descriptors
 //   outerEpk: Uint8Array,
 //   ephemeralDiversifier: Uint8Array,
 //   ephemeralPkD: Uint8Array,
 // }
 ```
+
+Each element of `dataDepositOutputScripts` is a full `scriptPubKey` for an
+`EVAL_NOTARY_EVIDENCE` transparent output with `nValue = 0`. Add them
+contiguously to the transaction starting at `dataDepositVoutIndex`; the
+daemon reader walks contiguous MULTIPART outputs to reassemble chunked
+payloads.
 
 ## Randomness
 
@@ -59,9 +70,13 @@ wasm-pack build --target nodejs --out-dir tests/node/pkg
 node tests/node/smoke.mjs
 ```
 
-The smoke test checks output shape, the documented `flags:13` byte layout
-(`0x01 0x0D` header, `0x27` master push on the deposit script), and that two
-calls with identical input diverge — proving the RNG is live inside the module.
+The smoke test covers shape (Uint8Array fields with expected lengths), the
+documented `flags:13` byte layout (`0x01 0x0D` header, `0x27` master push on
+the deposit script), RNG liveness (two calls with identical input diverge),
+chunking (a 10 KB payload produces multiple sub-6000-byte scripts), and
+signature attachment (the signed cmm value is larger than the unsigned one
+and its second descriptor starts with the flags:13 header at the correct
+offset).
 
 ## Byte-parity
 
