@@ -68,6 +68,18 @@ pub const SIGNATURE_DATA_KEY_LE: [u8; 20] = [
     0x9e, 0x35, 0x8b, 0xb4,
 ];
 
+/// `CrossChainDataRefKey` (`iP3euVSzNcXUrLNHnQnR9G6q8jeYuGSxgw`,
+/// URI `vrsc::data.type.object.crosschaindataref`) as 20 wire bytes.
+/// BE hex: `4d33e0aee0f648c7871b2661d1221b57c05aaed6`.
+///
+/// The `CVDXFDataRef` outer envelope uses this key; the envelope path
+/// emits it as the CDataDescriptor's `objectData` prefix (`vdxf.h:2818`,
+/// `pbaasrpc.cpp:16369`).
+pub const CROSS_CHAIN_DATA_REF_KEY_LE: [u8; 20] = [
+    0xd6, 0xae, 0x5a, 0xc0, 0x57, 0x1b, 0x22, 0xd1, 0x61, 0x26, 0x1b, 0x87, 0xc7, 0x48, 0xf6, 0xe0,
+    0xae, 0xe0, 0x33, 0x4d,
+];
+
 /// Append a `CVDXF` header: 20 bytes of `key` (already in wire-order LE) +
 /// `VARINT(version)`.
 pub fn write_cvdxf_header(buf: &mut Vec<u8>, key: &[u8; 20], version: u32) {
@@ -92,9 +104,10 @@ mod tests {
     /// reproduce that hex exactly.
     #[test]
     fn vdxf_key_constants_reverse_to_canonical_be_hash160() {
-        assert_eq!(be_hex(&DATA_DESCRIPTOR_KEY_LE), "4d4f12424ded2033a526a4e2a8835fc5b2eba208");
-        assert_eq!(be_hex(&MMR_DESCRIPTOR_KEY_LE),  "97273a4c02d6be002f8d69c3979616732ba68243");
-        assert_eq!(be_hex(&SIGNATURE_DATA_KEY_LE),  "b48b359e9a00042cec64f7f66ac717d388a4f22a");
+        assert_eq!(be_hex(&DATA_DESCRIPTOR_KEY_LE),      "4d4f12424ded2033a526a4e2a8835fc5b2eba208");
+        assert_eq!(be_hex(&MMR_DESCRIPTOR_KEY_LE),       "97273a4c02d6be002f8d69c3979616732ba68243");
+        assert_eq!(be_hex(&SIGNATURE_DATA_KEY_LE),       "b48b359e9a00042cec64f7f66ac717d388a4f22a");
+        assert_eq!(be_hex(&CROSS_CHAIN_DATA_REF_KEY_LE), "4d33e0aee0f648c7871b2661d1221b57c05aaed6");
     }
 
     fn be_hex(le: &[u8; 20]) -> String {

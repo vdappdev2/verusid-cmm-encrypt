@@ -7,5 +7,6 @@
 
 pub mod crypto;
 pub mod data_descriptor;
+pub mod data_ref;
 pub mod vdxf;
 pub mod wire;

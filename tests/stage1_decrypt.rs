@@ -11,6 +11,7 @@ use verusid_cmm_encrypt::crypto::{aead_decrypt, kdf_sapling, sapling_ka_agree};
 use verusid_cmm_encrypt::data_descriptor::{
     wrap_encrypted_with_key, write_data_descriptor, DataDescriptor,
 };
+use verusid_cmm_encrypt::data_ref::{write_cvdxf_data_ref_self_ref, SelfRefPointer};
 use verusid_cmm_encrypt::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
 
 /// `DataDescriptorKey` i-address (`i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv`)
@@ -190,6 +191,48 @@ fn wrap_encrypted_reproduces_fixture_ciphertext_byte_for_byte() {
         "encrypt-side output must match daemon's ciphertext byte-for-byte"
     );
     assert_eq!(wrapped.epk, epk);
+}
+
+/// Anchor for the `CVDXFDataRef` self-ref primitive. Extract the 63-byte
+/// `objectData` from the fixture's inner `CDataDescriptor` (which is a
+/// serialized `CVDXFDataRef` pointing at the tx's data-deposit output) and
+/// assert `write_cvdxf_data_ref_self_ref` reproduces it byte-for-byte.
+///
+/// For the t1_578528 fixture the data-deposit output sits at vout 0, so
+/// the pointer is (vout=0, obj=0, sub=0). If any of the nested
+/// CVDXFDataRef / CCrossChainDataRef / CPBaaSEvidenceRef serialization
+/// drifts, this test breaks.
+#[test]
+fn cvdxf_data_ref_self_ref_reproduces_fixture_inner_object_data() {
+    let raw = include_str!("fixtures/t1_578528.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let outer = &fixture["outerDescriptor"];
+
+    let ivk = hex_to_32(outer["ivk"].as_str().unwrap());
+    let epk = hex_to_32(outer["epk"].as_str().unwrap());
+    let ciphertext = hex::decode(outer["objectdata"].as_str().unwrap()).unwrap();
+    let dhsecret = sapling_ka_agree(&ivk, &epk).unwrap();
+    let key = kdf_sapling(&dhsecret, &epk);
+    let plaintext = aead_decrypt(&key, &ciphertext).unwrap();
+
+    // Layers: 22B CVDXF_Data header | inner CDataDescriptor (VARINT v=1,
+    // VARINT flags=0, CompactSize len=63, 63B objectData).
+    let inner_ddesc = &plaintext[22..];
+    assert_eq!(inner_ddesc[0], 0x01);
+    assert_eq!(inner_ddesc[1], 0x00);
+    assert_eq!(inner_ddesc[2], 0x3F, "inner objectData is 63 bytes");
+    let object_data = &inner_ddesc[3..3 + 63];
+
+    let mut rebuilt = Vec::new();
+    write_cvdxf_data_ref_self_ref(
+        &mut rebuilt,
+        &SelfRefPointer {
+            vout_index: 0,
+            object_num: 0,
+            sub_object: 0,
+        },
+    );
+    assert_eq!(rebuilt, object_data);
 }
 
 fn hex_to_32(s: &str) -> [u8; 32] {
