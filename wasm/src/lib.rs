@@ -21,7 +21,9 @@
 //! );
 //! // result: {
 //! //   cmmEntry: { vdxfKey: Uint8Array, value: Uint8Array },
-//! //   dataDepositOutputScript: Uint8Array,
+//! //   dataDepositOutputScripts: Array<Uint8Array>,  // 1 element normally,
+//! //                                                 // N when the payload
+//! //                                                 // triggers BreakApart
 //! //   publishedIvk: Uint8Array,
 //! //   outerEpk: Uint8Array,
 //! //   ephemeralDiversifier: Uint8Array,
@@ -29,7 +31,7 @@
 //! // }
 //! ```
 
-use js_sys::{Object, Reflect, Uint8Array};
+use js_sys::{Array, Object, Reflect, Uint8Array};
 use rand_core::OsRng;
 use verusid_cmm_encrypt::{
     encrypt_public_decrypt, EncryptError, EncryptRequest, EncryptResult,
@@ -111,10 +113,15 @@ fn build_result_object(result: &EncryptResult) -> Result<JsValue, JsValue> {
 
     let ret = Object::new();
     Reflect::set(&ret, &JsValue::from_str("cmmEntry"), &cmm_entry.into())?;
+
+    let scripts_array = Array::new();
+    for script in &result.data_deposit_output_scripts {
+        scripts_array.push(&Uint8Array::from(&script[..]).into());
+    }
     Reflect::set(
         &ret,
-        &JsValue::from_str("dataDepositOutputScript"),
-        &Uint8Array::from(&result.data_deposit_output_script[..]).into(),
+        &JsValue::from_str("dataDepositOutputScripts"),
+        &scripts_array.into(),
     )?;
     Reflect::set(
         &ret,

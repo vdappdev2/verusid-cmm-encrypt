@@ -28,7 +28,9 @@ const first = encryptPublicDecrypt(
 assert.ok(first.cmmEntry, "result.cmmEntry present");
 assert.ok(first.cmmEntry.vdxfKey instanceof Uint8Array, "vdxfKey is Uint8Array");
 assert.ok(first.cmmEntry.value instanceof Uint8Array, "value is Uint8Array");
-assert.ok(first.dataDepositOutputScript instanceof Uint8Array);
+assert.ok(Array.isArray(first.dataDepositOutputScripts), "scripts is Array");
+assert.equal(first.dataDepositOutputScripts.length, 1, "small payload = 1 script");
+assert.ok(first.dataDepositOutputScripts[0] instanceof Uint8Array);
 assert.ok(first.publishedIvk instanceof Uint8Array);
 assert.ok(first.outerEpk instanceof Uint8Array);
 assert.ok(first.ephemeralDiversifier instanceof Uint8Array);
@@ -49,10 +51,32 @@ assert.equal(first.cmmEntry.value[1], 0x0d, "cmm entry byte 1 = flags:13");
 
 // data-deposit script: first byte is master push length 0x27 (39 bytes)
 assert.equal(
-  first.dataDepositOutputScript[0],
+  first.dataDepositOutputScripts[0][0],
   0x27,
   "data-deposit script byte 0 = 0x27 master push",
 );
+
+// --- Chunking: payload above ~5.7 KB threshold produces multiple scripts ---
+const bigPayload = new Uint8Array(10_000).fill(0x5a);
+const chunked = encryptPublicDecrypt(
+  bigPayload,
+  outerVdxfKey,
+  systemId,
+  null,
+  null,
+  0,
+);
+assert.ok(
+  chunked.dataDepositOutputScripts.length >= 2,
+  `10 KB payload must produce >=2 scripts (got ${chunked.dataDepositOutputScripts.length})`,
+);
+for (const script of chunked.dataDepositOutputScripts) {
+  assert.ok(script instanceof Uint8Array);
+  assert.ok(
+    script.length < 6000,
+    `each chunk script must fit under MAX_SCRIPT_ELEMENT_SIZE (got ${script.length})`,
+  );
+}
 
 // vdxfKey field echoes the caller's input verbatim
 assert.deepEqual(

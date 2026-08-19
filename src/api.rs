@@ -7,9 +7,12 @@
 //! crypto is done here; the caller composes the returned bytes into a
 //! v4 transaction using whatever signing stack they prefer.
 //!
-//! Scope: the pure public-decrypt path (no `signdata`-supplied signature,
-//! no chunking, no multi-value entries). These variants are Phase-2 items
-//! per the scope report.
+//! Scope: the public-decrypt path. `signdata`-supplied signatures and
+//! multi-value entries are out of scope. Payloads that produce an
+//! `EVAL_NOTARY_EVIDENCE` output larger than `MAX_SCRIPT_ELEMENT_SIZE`
+//! (6000 bytes) are transparently split across N tx outputs via
+//! `CNotaryEvidence::BreakApart` (see `notary_evidence::break_apart` and
+//! `block.cpp:817-842`); the daemon reassembles on read.
 
 use ff::Field;
 use group::GroupEncoding;
@@ -23,9 +26,22 @@ use crate::data_descriptor::{
 };
 use crate::data_ref::{write_cvdxf_data_ref_self_ref, SelfRefPointer};
 use crate::ephemeral::{derive_epk, derive_g_d, generate_esk, EphemeralError};
-use crate::notary_evidence::{write_notary_evidence_for_envelope, EvidenceEntry};
+use crate::notary_evidence::{
+    break_apart, write_notary_evidence_for_envelope, EvidenceEntry,
+};
 use crate::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
 use crate::wire::WireError;
+
+/// `MAX_SCRIPT_ELEMENT_SIZE_PBAAS` (`script.h:36`) — the byte ceiling on any
+/// PBaaS script element, and the trigger the daemon uses to invoke
+/// `CNotaryEvidence::BreakApart` at `pbaasrpc.cpp:16405`.
+pub const MAX_SCRIPT_ELEMENT_SIZE: usize = 6000;
+
+/// Safety margin the daemon adds to `baseOverhead` at `pbaasrpc.cpp:16408`
+/// before subtracting it from `MAX_SCRIPT_ELEMENT_SIZE`. Absorbs the extra
+/// bytes each multipart wrapper adds on top of the empty-evidence baseline
+/// (chain-object header + MULTIPART type + `md` VARINTs + CompactSize).
+const BREAK_APART_SAFETY_MARGIN: usize = 128;
 
 /// Inputs to [`encrypt_public_decrypt`].
 #[derive(Debug, Clone)]
@@ -57,15 +73,20 @@ pub struct EncryptRequest<'a> {
 
 /// Outputs of [`encrypt_public_decrypt`]. The two byte artifacts the
 /// caller consumes are `cmm_entry` (goes into `Identity.content_multimap`)
-/// and `data_deposit_output_script` (goes into the tx as an
-/// `EVAL_NOTARY_EVIDENCE` transparent output with value 0).
+/// and `data_deposit_output_scripts` (each element goes into the tx as an
+/// `EVAL_NOTARY_EVIDENCE` transparent output with `nValue = 0`, in the
+/// order given, starting at `data_deposit_vout_index`).
 #[derive(Debug, Clone)]
 pub struct EncryptResult {
     /// `(vdxf_key, value_bytes)` pair to push into `content_multimap`.
     pub cmm_entry: ([u8; 20], Vec<u8>),
-    /// Full `scriptPubKey` for the `EVAL_NOTARY_EVIDENCE` data-deposit
-    /// transparent output. The output's `nValue` is 0.
-    pub data_deposit_output_script: Vec<u8>,
+    /// One full `scriptPubKey` per `EVAL_NOTARY_EVIDENCE` transparent output
+    /// the caller must add. Length 1 for payloads that fit in a single
+    /// output; N for payloads that trigger `CNotaryEvidence::BreakApart`.
+    /// All outputs are `nValue = 0` and must appear contiguously starting at
+    /// `request.data_deposit_vout_index`; the daemon reader walks contiguous
+    /// MULTIPART outputs to reassemble the original evidence.
+    pub data_deposit_output_scripts: Vec<Vec<u8>>,
     /// The IVK published on-chain in the outer descriptor. Anyone with
     /// this can decrypt both AEAD layers. Exposed so callers can log,
     /// re-derive, or hand off to reader code.
@@ -170,7 +191,7 @@ where
     let mut ced_data_vec = Vec::new();
     write_cvdxf_data(&mut ced_data_vec, &DATA_DESCRIPTOR_KEY_LE, 1, &pass1_cdd_bytes);
 
-    // === 4. Build CNotaryEvidence + EVAL_NOTARY_EVIDENCE scriptPubKey ===
+    // === 4. Build CNotaryEvidence + EVAL_NOTARY_EVIDENCE scriptPubKey(s) ===
     let mut notary_evidence_bytes = Vec::new();
     write_notary_evidence_for_envelope(
         &mut notary_evidence_bytes,
@@ -180,8 +201,34 @@ where
             data: &ced_data_vec,
         }],
     );
-    let mut data_deposit_script = Vec::new();
-    write_eval_notary_evidence_script(&mut data_deposit_script, &notary_evidence_bytes);
+    let mut trial_script = Vec::new();
+    write_eval_notary_evidence_script(&mut trial_script, &notary_evidence_bytes);
+    let data_deposit_scripts = if trial_script.len() >= MAX_SCRIPT_ELEMENT_SIZE {
+        // Match the daemon's threshold logic at pbaasrpc.cpp:16405-16418: split
+        // the serialized CNotaryEvidence into MULTIPART chunks, each wrapped in
+        // its own EVAL_NOTARY_EVIDENCE output. The reader (block.cpp:844-873)
+        // walks contiguous MULTIPART outputs to reassemble.
+        let empty_evidence_bytes = {
+            let mut buf = Vec::new();
+            write_notary_evidence_for_envelope(&mut buf, &request.system_id, &[]);
+            buf
+        };
+        let mut empty_script = Vec::new();
+        write_eval_notary_evidence_script(&mut empty_script, &empty_evidence_bytes);
+        let base_overhead = empty_script.len() + BREAK_APART_SAFETY_MARGIN;
+        let max_chunk_size = MAX_SCRIPT_ELEMENT_SIZE - base_overhead;
+        let chunk_wrappers = break_apart(&request.system_id, &notary_evidence_bytes, max_chunk_size);
+        chunk_wrappers
+            .iter()
+            .map(|wrapper| {
+                let mut s = Vec::new();
+                write_eval_notary_evidence_script(&mut s, wrapper);
+                s
+            })
+            .collect()
+    } else {
+        vec![trial_script]
+    };
 
     // === 5. Build the inner CDD that will be wrap-encrypted for the outer cmm entry ===
     // Its objectData is the CVDXFDataRef self-ref pointing at the data-deposit vout.
@@ -228,7 +275,7 @@ where
 
     Ok(EncryptResult {
         cmm_entry: (request.outer_vdxf_key, outer_cdd_bytes),
-        data_deposit_output_script: data_deposit_script,
+        data_deposit_output_scripts: data_deposit_scripts,
         published_ivk: ivk_bytes,
         outer_epk: wrapped.epk,
         ephemeral_diversifier: diversifier,
@@ -295,11 +342,11 @@ mod tests {
         let req = sample_request(b"payload");
         let result = encrypt_public_decrypt(&req, &mut rng).unwrap();
         // masterParams outer push = 0x27 (39-byte push).
-        assert_eq!(result.data_deposit_output_script[0], 0x27);
+        assert_eq!(result.data_deposit_output_scripts[0][0], 0x27);
         // Byte 40 is OP_CHECKCRYPTOCONDITION.
-        assert_eq!(result.data_deposit_output_script[40], 0xcc);
+        assert_eq!(result.data_deposit_output_scripts[0][40], 0xcc);
         // Last byte is OP_DROP.
-        assert_eq!(*result.data_deposit_output_script.last().unwrap(), 0x75);
+        assert_eq!(*result.data_deposit_output_scripts[0].last().unwrap(), 0x75);
     }
 
     #[test]
@@ -310,7 +357,7 @@ mod tests {
         let a = encrypt_public_decrypt(&sample_request(plaintext), &mut rng1).unwrap();
         let b = encrypt_public_decrypt(&sample_request(plaintext), &mut rng2).unwrap();
         assert_eq!(a.cmm_entry.1, b.cmm_entry.1);
-        assert_eq!(a.data_deposit_output_script, b.data_deposit_output_script);
+        assert_eq!(a.data_deposit_output_scripts, b.data_deposit_output_scripts);
         assert_eq!(a.published_ivk, b.published_ivk);
         assert_eq!(a.outer_epk, b.outer_epk);
     }
@@ -323,6 +370,52 @@ mod tests {
         let b = encrypt_public_decrypt(&sample_request(b"same plaintext"), &mut rng2).unwrap();
         assert_ne!(a.cmm_entry.1, b.cmm_entry.1, "different seeds should diverge");
         assert_ne!(a.published_ivk, b.published_ivk);
+    }
+
+    #[test]
+    fn small_payload_produces_single_data_deposit_script() {
+        let mut rng = ChaCha20Rng::seed_from_u64(11);
+        let result = encrypt_public_decrypt(&sample_request(b"tiny"), &mut rng).unwrap();
+        assert_eq!(result.data_deposit_output_scripts.len(), 1);
+        assert!(
+            result.data_deposit_output_scripts[0].len() < MAX_SCRIPT_ELEMENT_SIZE,
+            "single output must fit under MAX_SCRIPT_ELEMENT_SIZE"
+        );
+    }
+
+    #[test]
+    fn payload_above_threshold_produces_multiple_scripts_all_under_limit() {
+        // 10 KB plaintext comfortably exceeds the single-output threshold
+        // (~5.7 KB after envelope overhead) and forces BreakApart.
+        let plaintext = vec![0x5Au8; 10_000];
+        let mut rng = ChaCha20Rng::seed_from_u64(12);
+        let result = encrypt_public_decrypt(&sample_request(&plaintext), &mut rng).unwrap();
+
+        assert!(
+            result.data_deposit_output_scripts.len() >= 2,
+            "10 KB payload must chunk (got {} scripts)",
+            result.data_deposit_output_scripts.len()
+        );
+        for (i, script) in result.data_deposit_output_scripts.iter().enumerate() {
+            assert!(
+                script.len() < MAX_SCRIPT_ELEMENT_SIZE,
+                "chunk {i} script len {} exceeds MAX_SCRIPT_ELEMENT_SIZE",
+                script.len()
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_output_still_has_a_single_cmm_entry() {
+        // Only the tx outputs are split; the cmm entry (a single outer
+        // CDataDescriptor) stays a single value regardless of chunk count.
+        let plaintext = vec![0x77u8; 12_000];
+        let mut rng = ChaCha20Rng::seed_from_u64(13);
+        let result = encrypt_public_decrypt(&sample_request(&plaintext), &mut rng).unwrap();
+        assert!(result.data_deposit_output_scripts.len() >= 2);
+        assert_eq!(result.cmm_entry.0, [0xAAu8; 20]);
+        assert_eq!(result.cmm_entry.1[0], 0x01);
+        assert_eq!(result.cmm_entry.1[1], 0x0D, "flags:13 outer CDD");
     }
 
     #[test]
@@ -413,7 +506,7 @@ mod tests {
 
         // Locate the data-deposit output's inner ciphertext by parsing the
         // scriptPubKey down to the CEvidenceData dataVec.
-        let script = &result.data_deposit_output_script;
+        let script = &result.data_deposit_output_scripts[0];
         // Skip 40 bytes master push, 1 byte OP_CHECKCRYPTOCONDITION.
         // Next: OP_PUSHDATA1 or OP_PUSHDATA2 for vParams. Read the length.
         let vparams_start;
