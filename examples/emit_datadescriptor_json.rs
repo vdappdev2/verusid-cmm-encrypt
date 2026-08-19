@@ -33,6 +33,7 @@ fn main() {
         label: None,
         mime_type: None,
         data_deposit_vout_index: 7,
+        signature: None,
     };
     let result = encrypt_public_decrypt(&request, &mut rng).expect("encrypt");
 

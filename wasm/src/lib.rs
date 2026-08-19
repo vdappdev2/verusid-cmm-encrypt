@@ -18,6 +18,8 @@
 //!   label,             // string | null | undefined
 //!   mimeType,          // string | null | undefined
 //!   dataDepositVoutIndex, // number, u32
+//!   signature,         // Uint8Array | null | undefined — attach a caller-
+//!                      // supplied signature as a second cmm descriptor
 //! );
 //! // result: {
 //! //   cmmEntry: { vdxfKey: Uint8Array, value: Uint8Array },
@@ -53,10 +55,12 @@ pub fn encrypt_public_decrypt_js(
     label: Option<String>,
     mime_type: Option<String>,
     data_deposit_vout_index: u32,
+    signature: Option<Uint8Array>,
 ) -> Result<JsValue, JsError> {
     let outer_vdxf_key = to_20b(&outer_vdxf_key, "outerVdxfKey")?;
     let system_id = to_20b(&system_id, "systemId")?;
     let plaintext_bytes = plaintext.to_vec();
+    let signature_bytes = signature.map(|s| s.to_vec());
 
     let request = EncryptRequest {
         plaintext: &plaintext_bytes,
@@ -65,6 +69,7 @@ pub fn encrypt_public_decrypt_js(
         label: label.as_deref(),
         mime_type: mime_type.as_deref(),
         data_deposit_vout_index,
+        signature: signature_bytes.as_deref(),
     };
 
     let mut rng = OsRng;

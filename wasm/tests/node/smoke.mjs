@@ -22,6 +22,7 @@ const first = encryptPublicDecrypt(
   null,
   null,
   0,
+  null,
 );
 
 // --- Shape checks ---
@@ -65,6 +66,7 @@ const chunked = encryptPublicDecrypt(
   null,
   null,
   0,
+  null,
 );
 assert.ok(
   chunked.dataDepositOutputScripts.length >= 2,
@@ -93,11 +95,43 @@ const second = encryptPublicDecrypt(
   null,
   null,
   0,
+  null,
 );
 assert.notDeepEqual(
   Array.from(first.publishedIvk),
   Array.from(second.publishedIvk),
   "two calls with identical input produce different published_ivk (RNG live)",
+);
+
+// --- Signature attachment: passing a signature appends a second descriptor
+//     to the cmm entry value, roughly doubling its length ---
+const sigBytes = new TextEncoder().encode("caller-supplied signature blob");
+const signed = encryptPublicDecrypt(
+  plaintext,
+  outerVdxfKey,
+  systemId,
+  null,
+  null,
+  0,
+  sigBytes,
+);
+assert.ok(
+  signed.cmmEntry.value.length > first.cmmEntry.value.length,
+  "signed cmm value must be larger than unsigned",
+);
+// Signature descriptor sits after the first descriptor. Parse the first
+// descriptor's length: 3 (v+flags+CS) + ct_len + 33 (epk) + 33 (ivk).
+const ctLen = signed.cmmEntry.value[2];
+const firstDescEnd = 3 + ctLen + 33 + 33;
+assert.equal(
+  signed.cmmEntry.value[firstDescEnd],
+  0x01,
+  "second descriptor version byte",
+);
+assert.equal(
+  signed.cmmEntry.value[firstDescEnd + 1],
+  0x0d,
+  "second descriptor flags = 13",
 );
 
 // --- Error path: wrong-length key rejected with a JS Error ---
@@ -110,6 +144,7 @@ assert.throws(
       null,
       null,
       0,
+      null,
     ),
   /outerVdxfKey must be exactly 20 bytes/,
   "19-byte outerVdxfKey rejected",

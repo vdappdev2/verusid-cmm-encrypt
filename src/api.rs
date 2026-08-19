@@ -29,8 +29,15 @@ use crate::ephemeral::{derive_epk, derive_g_d, generate_esk, EphemeralError};
 use crate::notary_evidence::{
     break_apart, write_notary_evidence_for_envelope, EvidenceEntry,
 };
-use crate::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
+use crate::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE, SIGNATURE_DATA_KEY_LE};
 use crate::wire::WireError;
+
+/// `label` value the daemon stamps on the signature's outer CDataDescriptor
+/// (`pbaasrpc.cpp:16383`).
+const SIGNATURE_OUTER_LABEL: &str = "signature";
+/// `mimetype` value the daemon stamps on the signature's outer CDataDescriptor
+/// (`pbaasrpc.cpp:16383`).
+const SIGNATURE_OUTER_MIME_TYPE: &str = "application/json";
 
 /// `MAX_SCRIPT_ELEMENT_SIZE_PBAAS` (`script.h:36`) — the byte ceiling on any
 /// PBaaS script element, and the trigger the daemon uses to invoke
@@ -69,6 +76,19 @@ pub struct EncryptRequest<'a> {
     /// that assemble a different tx layout supply the actual index they
     /// will use.
     pub data_deposit_vout_index: u32,
+    /// Optional caller-supplied signature bytes to attach to this entry.
+    /// When present, the encrypt path emits a SECOND `CVDXFDataDescriptor`
+    /// appended to the cmm entry value, with `label = "signature"` and
+    /// `mimetype = "application/json"` (`pbaasrpc.cpp:16383`), pointing at
+    /// `sub_object = 1` of the same data-deposit output; the daemon
+    /// serializes a matching second chain object in the `CNotaryEvidence`
+    /// under `SIGNATURE_DATA_KEY`. Both descriptors are encrypted to the
+    /// same published ivk — one key decrypts both.
+    ///
+    /// Producing the signature bytes themselves is out of scope. Typical
+    /// sources: the daemon's `signdata` RPC, or an offline
+    /// `CVDXFSignatureData`-formatted signature the caller assembles.
+    pub signature: Option<&'a [u8]>,
 }
 
 /// Outputs of [`encrypt_public_decrypt`]. The two byte artifacts the
@@ -171,36 +191,47 @@ where
     // === 2. Pass-1 AEAD over raw user plaintext ===
     // Produces the flags:5 CDataDescriptor that goes inside the CEvidenceData
     // dataVec on the data-deposit vout.
-    let esk1 = generate_esk(rng);
-    let epk1 = derive_epk(&esk1, &diversifier)?;
-    let dhsecret1 = sapling_ka_agree(&esk1, &pk_d_bytes)?;
-    let k1 = kdf_sapling(&dhsecret1, &epk1);
-    let pass1_ciphertext = aead_encrypt(&k1, request.plaintext);
+    let pass1_data_cdd_bytes = encrypt_pass1_cdd(request.plaintext, &diversifier, &pk_d_bytes, rng)?;
 
-    let pass1_cdd = DataDescriptor {
-        encrypted: true,
-        object_data: &pass1_ciphertext,
-        epk: Some(&epk1),
-        version: 1,
-        ..Default::default()
+    // === 2b. Pass-1 AEAD over signature bytes (if present) ===
+    // Same shape as the data pass-1, but keyed under SIGNATURE_DATA_KEY inside
+    // its CVDXF_Data wrapper and placed as a second chain object in the
+    // CNotaryEvidence (`pbaasrpc.cpp:16380-16394`). Uses independent
+    // ephemeral esk (different epk & ciphertext) but the SAME pk_d, so the
+    // one published ivk decrypts both.
+    let pass1_sig_cdd_bytes = match request.signature {
+        Some(sig) => Some(encrypt_pass1_cdd(sig, &diversifier, &pk_d_bytes, rng)?),
+        None => None,
     };
-    let mut pass1_cdd_bytes = Vec::new();
-    write_data_descriptor(&mut pass1_cdd_bytes, &pass1_cdd)?;
 
-    // === 3. Wrap pass-1 CDD in CVDXF_Data → becomes CEvidenceData.dataVec ===
-    let mut ced_data_vec = Vec::new();
-    write_cvdxf_data(&mut ced_data_vec, &DATA_DESCRIPTOR_KEY_LE, 1, &pass1_cdd_bytes);
-
-    // === 4. Build CNotaryEvidence + EVAL_NOTARY_EVIDENCE scriptPubKey(s) ===
-    let mut notary_evidence_bytes = Vec::new();
-    write_notary_evidence_for_envelope(
-        &mut notary_evidence_bytes,
-        &request.system_id,
-        &[EvidenceEntry {
-            vdxf_key: &DATA_DESCRIPTOR_KEY_LE,
-            data: &ced_data_vec,
-        }],
+    // === 3. Wrap pass-1 CDDs in CVDXF_Data → become CEvidenceData.dataVec entries ===
+    let mut ced_data_vec_data = Vec::new();
+    write_cvdxf_data(
+        &mut ced_data_vec_data,
+        &DATA_DESCRIPTOR_KEY_LE,
+        1,
+        &pass1_data_cdd_bytes,
     );
+    let ced_data_vec_sig = pass1_sig_cdd_bytes.as_ref().map(|bytes| {
+        let mut v = Vec::new();
+        write_cvdxf_data(&mut v, &SIGNATURE_DATA_KEY_LE, 1, bytes);
+        v
+    });
+
+    // === 4. Build CNotaryEvidence (1 or 2 entries) + EVAL_NOTARY_EVIDENCE scriptPubKey(s) ===
+    let mut entries: Vec<EvidenceEntry<'_>> = Vec::with_capacity(2);
+    entries.push(EvidenceEntry {
+        vdxf_key: &DATA_DESCRIPTOR_KEY_LE,
+        data: &ced_data_vec_data,
+    });
+    if let Some(ref ced_sig) = ced_data_vec_sig {
+        entries.push(EvidenceEntry {
+            vdxf_key: &SIGNATURE_DATA_KEY_LE,
+            data: ced_sig,
+        });
+    }
+    let mut notary_evidence_bytes = Vec::new();
+    write_notary_evidence_for_envelope(&mut notary_evidence_bytes, &request.system_id, &entries);
     let mut trial_script = Vec::new();
     write_eval_notary_evidence_script(&mut trial_script, &notary_evidence_bytes);
     let data_deposit_scripts = if trial_script.len() >= MAX_SCRIPT_ELEMENT_SIZE {
@@ -230,57 +261,138 @@ where
         vec![trial_script]
     };
 
-    // === 5. Build the inner CDD that will be wrap-encrypted for the outer cmm entry ===
-    // Its objectData is the CVDXFDataRef self-ref pointing at the data-deposit vout.
+    // === 5. Build the DATA outer CDataDescriptor ===
+    // Inner objectData is the CVDXFDataRef self-ref pointing at (vout, sub_object=0).
     // Label and mime live HERE (inside the ciphertext), matching the daemon's
     // WrapEncrypted behaviour at vdxf.h:1058-1059 where the outer's label/mime
     // are cleared after WrapEncrypted.
-    let mut ccdr_bytes = Vec::new();
-    write_cvdxf_data_ref_self_ref(
-        &mut ccdr_bytes,
-        &SelfRefPointer {
-            vout_index: request.data_deposit_vout_index,
-            object_num: 0,
-            sub_object: 0,
-        },
-    );
-    let inner_cdd = DataDescriptor {
-        object_data: &ccdr_bytes,
-        label: request.label,
-        mime_type: request.mime_type,
-        version: 1,
-        ..Default::default()
-    };
-
-    // === 6. Pass-2: wrap-encrypt the inner CDD ===
-    let esk2 = generate_esk(rng);
-    let epk2 = derive_epk(&esk2, &diversifier)?;
-    let dhsecret2 = sapling_ka_agree(&esk2, &pk_d_bytes)?;
-    let k2 = kdf_sapling(&dhsecret2, &epk2);
-    let wrapped = wrap_encrypted_with_key(&inner_cdd, &k2, &epk2)?;
-
-    // === 7. Build the outer flags:13 CDataDescriptor ===
-    // Fields: encrypted=true + epk + ivk. No label/mime — they went into the
-    // wrapped inner. Flags: 1 (encrypted) | 4 (epk) | 8 (ivk) = 13.
-    let outer_cdd = DataDescriptor {
+    let data_outer_wrapped = build_outer_wrapped_descriptor(
+        request.data_deposit_vout_index,
+        0,
+        request.label,
+        request.mime_type,
+        &diversifier,
+        &pk_d_bytes,
+        rng,
+    )?;
+    let data_outer_cdd = DataDescriptor {
         encrypted: true,
-        object_data: &wrapped.object_data,
-        epk: Some(&wrapped.epk),
+        object_data: &data_outer_wrapped.object_data,
+        epk: Some(&data_outer_wrapped.epk),
         ivk: Some(&ivk_bytes),
         version: 1,
         ..Default::default()
     };
-    let mut outer_cdd_bytes = Vec::new();
-    write_data_descriptor(&mut outer_cdd_bytes, &outer_cdd)?;
+    let mut cmm_value = Vec::new();
+    write_data_descriptor(&mut cmm_value, &data_outer_cdd)?;
+
+    // === 6. Build the SIGNATURE outer CDataDescriptor (if signature present) ===
+    // CCDR uses sub_object=1 to distinguish from the data descriptor
+    // (`pbaasrpc.cpp:16382`). Label and mime match the daemon's hard-coded
+    // values so the on-chain shape is byte-identical to what `signdata` emits.
+    // The result is concatenated onto the cmm entry value: the daemon parses
+    // multiple back-to-back CVDXFDataDescriptors in a single cmm entry.
+    if request.signature.is_some() {
+        let sig_outer_wrapped = build_outer_wrapped_descriptor(
+            request.data_deposit_vout_index,
+            1,
+            Some(SIGNATURE_OUTER_LABEL),
+            Some(SIGNATURE_OUTER_MIME_TYPE),
+            &diversifier,
+            &pk_d_bytes,
+            rng,
+        )?;
+        let sig_outer_cdd = DataDescriptor {
+            encrypted: true,
+            object_data: &sig_outer_wrapped.object_data,
+            epk: Some(&sig_outer_wrapped.epk),
+            ivk: Some(&ivk_bytes),
+            version: 1,
+            ..Default::default()
+        };
+        write_data_descriptor(&mut cmm_value, &sig_outer_cdd)?;
+    }
 
     Ok(EncryptResult {
-        cmm_entry: (request.outer_vdxf_key, outer_cdd_bytes),
+        cmm_entry: (request.outer_vdxf_key, cmm_value),
         data_deposit_output_scripts: data_deposit_scripts,
         published_ivk: ivk_bytes,
-        outer_epk: wrapped.epk,
+        outer_epk: data_outer_wrapped.epk,
         ephemeral_diversifier: diversifier,
         ephemeral_pk_d: pk_d_bytes,
     })
+}
+
+/// Encrypt `plaintext` into a stage-1 (pass-1) `CDataDescriptor` with a fresh
+/// ephemeral key: `esk` → `epk` → shared secret with `pk_d_bytes` → KDF →
+/// AEAD. The resulting `CDataDescriptor` has flags:5
+/// (`FLAG_ENCRYPTED_DATA | FLAG_ENCRYPTION_PUBLIC_KEY_PRESENT`), no ivk on
+/// this layer — the daemon puts the ivk on the outer descriptor instead.
+fn encrypt_pass1_cdd<R>(
+    plaintext: &[u8],
+    diversifier: &[u8; 11],
+    pk_d_bytes: &[u8; 32],
+    rng: &mut R,
+) -> Result<Vec<u8>, EncryptError>
+where
+    R: RngCore + CryptoRng,
+{
+    let esk = generate_esk(rng);
+    let epk = derive_epk(&esk, diversifier)?;
+    let dhsecret = sapling_ka_agree(&esk, pk_d_bytes)?;
+    let k = kdf_sapling(&dhsecret, &epk);
+    let ciphertext = aead_encrypt(&k, plaintext);
+
+    let cdd = DataDescriptor {
+        encrypted: true,
+        object_data: &ciphertext,
+        epk: Some(&epk),
+        version: 1,
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    write_data_descriptor(&mut buf, &cdd)?;
+    Ok(buf)
+}
+
+/// Build one outer wrapped descriptor: construct the inner CDataDescriptor
+/// whose objectData is a CVDXFDataRef self-ref at `(vout, object_num=0,
+/// sub_object)`, then wrap-encrypt it with a fresh ephemeral key. Returns
+/// the wrap-encrypted `object_data` and `epk` bytes for the caller to
+/// assemble into a flags:13 outer CDataDescriptor.
+fn build_outer_wrapped_descriptor<R>(
+    vout_index: u32,
+    sub_object: u32,
+    label: Option<&str>,
+    mime_type: Option<&str>,
+    diversifier: &[u8; 11],
+    pk_d_bytes: &[u8; 32],
+    rng: &mut R,
+) -> Result<crate::data_descriptor::WrappedEncrypted, EncryptError>
+where
+    R: RngCore + CryptoRng,
+{
+    let mut ccdr_bytes = Vec::new();
+    write_cvdxf_data_ref_self_ref(
+        &mut ccdr_bytes,
+        &SelfRefPointer {
+            vout_index,
+            object_num: 0,
+            sub_object,
+        },
+    );
+    let inner_cdd = DataDescriptor {
+        object_data: &ccdr_bytes,
+        label,
+        mime_type,
+        version: 1,
+        ..Default::default()
+    };
+    let esk = generate_esk(rng);
+    let epk = derive_epk(&esk, diversifier)?;
+    let dhsecret = sapling_ka_agree(&esk, pk_d_bytes)?;
+    let k = kdf_sapling(&dhsecret, &epk);
+    Ok(wrap_encrypted_with_key(&inner_cdd, &k, &epk)?)
 }
 
 /// Sample random 11-byte diversifiers until one decodes under Sapling's
@@ -313,6 +425,7 @@ mod tests {
             label: None,
             mime_type: None,
             data_deposit_vout_index: 0,
+            signature: None,
         }
     }
 
@@ -370,6 +483,141 @@ mod tests {
         let b = encrypt_public_decrypt(&sample_request(b"same plaintext"), &mut rng2).unwrap();
         assert_ne!(a.cmm_entry.1, b.cmm_entry.1, "different seeds should diverge");
         assert_ne!(a.published_ivk, b.published_ivk);
+    }
+
+    #[test]
+    fn signature_none_produces_single_outer_descriptor_in_cmm_entry() {
+        // With no signature, cmm entry is exactly one outer CDataDescriptor:
+        //   0x01 (v) | 0x0D (flags) | CompactSize(ct_len) | ct | 0x20 epk | 0x20 ivk
+        // For small plaintext: ct is under 253 bytes → single-byte CompactSize.
+        let mut rng = ChaCha20Rng::seed_from_u64(20);
+        let result = encrypt_public_decrypt(&sample_request(b"no sig"), &mut rng).unwrap();
+        let value = &result.cmm_entry.1;
+        assert_eq!(value[0], 0x01);
+        assert_eq!(value[1], 0x0D);
+        let ct_len = usize::from(value[2]);
+        let expected_len = 3 + ct_len + 33 + 33;
+        assert_eq!(value.len(), expected_len, "one outer CDD only");
+    }
+
+    #[test]
+    fn signature_present_appends_second_outer_descriptor_to_cmm_entry() {
+        let mut rng = ChaCha20Rng::seed_from_u64(21);
+        let sig_bytes = b"caller-supplied signature blob";
+        let req = EncryptRequest {
+            signature: Some(sig_bytes),
+            ..sample_request(b"data with signature")
+        };
+        let result = encrypt_public_decrypt(&req, &mut rng).unwrap();
+        let value = &result.cmm_entry.1;
+
+        // Parse the first (data) descriptor to find where it ends.
+        assert_eq!(value[0], 0x01);
+        assert_eq!(value[1], 0x0D);
+        let ct_len_1 = usize::from(value[2]);
+        let first_end = 3 + ct_len_1 + 33 + 33;
+        assert!(value.len() > first_end, "there must be more bytes after data CDD");
+
+        // Second descriptor also has flags:13 header.
+        assert_eq!(value[first_end], 0x01, "second CDD version");
+        assert_eq!(value[first_end + 1], 0x0D, "second CDD flags = 13");
+    }
+
+    #[test]
+    fn signature_present_notary_evidence_carries_two_entries_and_signature_key() {
+        // The daemon expects a second chain object under SIGNATURE_DATA_KEY in
+        // the CNotaryEvidence. Verify our writer emits it. We inspect the
+        // deposit script bytes (single output — payload stays under threshold).
+        use crate::vdxf::SIGNATURE_DATA_KEY_LE;
+        let mut rng = ChaCha20Rng::seed_from_u64(22);
+        let req = EncryptRequest {
+            signature: Some(b"sig"),
+            ..sample_request(b"data")
+        };
+        let result = encrypt_public_decrypt(&req, &mut rng).unwrap();
+        assert_eq!(result.data_deposit_output_scripts.len(), 1);
+        let script = &result.data_deposit_output_scripts[0];
+
+        // SIGNATURE_DATA_KEY_LE must appear somewhere in the serialized bytes
+        // (once as the CEvidenceData vdxfd, once inside the CVDXF_Data-wrap).
+        let key_slice = &SIGNATURE_DATA_KEY_LE[..];
+        let occurrences = script
+            .windows(key_slice.len())
+            .filter(|w| *w == key_slice)
+            .count();
+        assert!(
+            occurrences >= 2,
+            "expected SIGNATURE_DATA_KEY_LE to appear at least twice in script (got {})",
+            occurrences
+        );
+    }
+
+    #[test]
+    fn signature_outer_decrypts_to_ccdr_pointer_with_sub_object_1() {
+        // Encrypt with a signature; extract the signature outer descriptor
+        // ciphertext; decrypt with the published_ivk; verify the recovered
+        // CCDR points at sub_object=1 (the daemon's convention at
+        // pbaasrpc.cpp:16382).
+        let mut rng = ChaCha20Rng::seed_from_u64(23);
+        let req = EncryptRequest {
+            data_deposit_vout_index: 4,
+            signature: Some(b"any-sig-bytes"),
+            ..sample_request(b"payload")
+        };
+        let result = encrypt_public_decrypt(&req, &mut rng).unwrap();
+        let value = &result.cmm_entry.1;
+
+        // Skip past the DATA descriptor.
+        let ct_len_1 = usize::from(value[2]);
+        let sig_start = 3 + ct_len_1 + 33 + 33;
+        let sig_desc = &value[sig_start..];
+
+        // Parse signature descriptor.
+        assert_eq!(sig_desc[0], 0x01);
+        assert_eq!(sig_desc[1], 0x0D);
+        assert!(sig_desc[2] < 0xFD, "single-byte CompactSize expected for this fixture");
+        let ct_len_2 = usize::from(sig_desc[2]);
+        let sig_ct = &sig_desc[3..3 + ct_len_2];
+        // epk immediately follows (prefixed with 0x20 length byte).
+        assert_eq!(sig_desc[3 + ct_len_2], 0x20);
+        let sig_epk: [u8; 32] = sig_desc[3 + ct_len_2 + 1..3 + ct_len_2 + 33]
+            .try_into()
+            .unwrap();
+
+        // Decrypt the signature outer AEAD.
+        let dhsecret = sapling_ka_agree(&result.published_ivk, &sig_epk).unwrap();
+        let k = kdf_sapling(&dhsecret, &sig_epk);
+        let recovered = aead_decrypt(&k, sig_ct).unwrap();
+
+        // Recovered plaintext is CVDXF_Data(DataDescriptorKey, inner_sig_cdd_bytes)
+        // where the inner CDD carries label="signature", mime="application/json",
+        // and objectData is the CCDR pointer with sub_object=1.
+        assert_eq!(&recovered[..20], &DATA_DESCRIPTOR_KEY_LE);
+        // Skip 20B key + 1B version + 1B CompactSize inner_len → inner CDD starts at 22
+        let inner_len = usize::from(recovered[21]);
+        let inner_cdd = &recovered[22..22 + inner_len];
+
+        // Inner CDD flags: label (0x20) | mime (0x40) = 0x60. Version = 1.
+        assert_eq!(inner_cdd[0], 0x01);
+        assert_eq!(inner_cdd[1], 0x60, "inner flags = LABEL | MIME");
+
+        // The "signature" label and "application/json" mime bytes are embedded
+        // in the plaintext, order per CDataDescriptor::CalcFlags ordering.
+        let sig_label_bytes = SIGNATURE_OUTER_LABEL.as_bytes();
+        let sig_mime_bytes = SIGNATURE_OUTER_MIME_TYPE.as_bytes();
+        let inner_contains = |needle: &[u8]| -> bool {
+            inner_cdd.windows(needle.len()).any(|w| w == needle)
+        };
+        assert!(inner_contains(sig_label_bytes), "inner CDD must contain \"signature\" label bytes");
+        assert!(inner_contains(sig_mime_bytes), "inner CDD must contain \"application/json\" mime bytes");
+
+        // The CCDR self-ref bytes end with VARINT(object_num=0) | VARINT(sub_object=1).
+        // For a 63-byte CVDXFDataRef with sub_object=1, the last byte of the
+        // CPBaaSEvidenceRef is 0x01.
+        assert!(
+            inner_cdd.windows(2).any(|w| w == [0x00, 0x01]),
+            "inner CDD must encode object_num=0, sub_object=1 pair"
+        );
     }
 
     #[test]
