@@ -8,6 +8,7 @@
 //! `chainvue-things/flags13-writer-lib/scoping/byte-parity-experiment/`.
 
 use verusid_cmm_encrypt::crypto::{aead_decrypt, kdf_sapling, sapling_ka_agree};
+use verusid_cmm_encrypt::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
 
 /// `DataDescriptorKey` i-address (`i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv`)
 /// hash160 in canonical big-endian order.
@@ -59,6 +60,35 @@ fn stage1_decrypt_of_daemon_written_entry_matches_expected_framing() {
         plaintext.len(),
         "CompactSize declared length ({inner_len}B) should account for the rest of the plaintext"
     );
+}
+
+/// Round-trip check: the stage-1 plaintext IS a serialized `CVDXF_Data`, so
+/// if we peel off its 22-byte header + `inner` bytes and hand `inner` back
+/// to `write_cvdxf_data` we must reproduce the plaintext byte-for-byte.
+/// This is the framing side's counterpart to the crypto side's decrypt.
+#[test]
+fn cvdxf_data_reserializes_the_stage1_plaintext_byte_for_byte() {
+    let raw = include_str!("fixtures/t1_578528.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).expect("parse fixture json");
+    let outer = &fixture["outerDescriptor"];
+
+    let ivk = hex_to_32(outer["ivk"].as_str().unwrap());
+    let epk = hex_to_32(outer["epk"].as_str().unwrap());
+    let ciphertext = hex::decode(outer["objectdata"].as_str().unwrap()).unwrap();
+    let dhsecret = sapling_ka_agree(&ivk, &epk).unwrap();
+    let key = kdf_sapling(&dhsecret, &epk);
+    let plaintext = aead_decrypt(&key, &ciphertext).unwrap();
+
+    // The plaintext layout is: 20B key + VARINT(version=1) + CompactSize(len) + len bytes.
+    // For this fixture the length prefix is a single byte < 0xFD.
+    assert_eq!(&plaintext[..20], &DATA_DESCRIPTOR_KEY_LE);
+    assert_eq!(plaintext[20], 0x01);
+    assert!(plaintext[21] < 0xFD);
+    let inner = &plaintext[22..];
+
+    let mut reserialized = Vec::new();
+    write_cvdxf_data(&mut reserialized, &DATA_DESCRIPTOR_KEY_LE, 1, inner);
+    assert_eq!(reserialized, plaintext);
 }
 
 fn hex_to_32(s: &str) -> [u8; 32] {
