@@ -8,5 +8,6 @@
 pub mod crypto;
 pub mod data_descriptor;
 pub mod data_ref;
+pub mod notary_evidence;
 pub mod vdxf;
 pub mod wire;

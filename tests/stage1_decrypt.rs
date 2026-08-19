@@ -12,6 +12,9 @@ use verusid_cmm_encrypt::data_descriptor::{
     wrap_encrypted_with_key, write_data_descriptor, DataDescriptor,
 };
 use verusid_cmm_encrypt::data_ref::{write_cvdxf_data_ref_self_ref, SelfRefPointer};
+use verusid_cmm_encrypt::notary_evidence::{
+    write_notary_evidence_for_envelope, EvidenceEntry,
+};
 use verusid_cmm_encrypt::vdxf::{write_cvdxf_data, DATA_DESCRIPTOR_KEY_LE};
 
 /// `DataDescriptorKey` i-address (`i4GC1YGEVD21afWudGoFJVdnfjJ5XWnCQv`)
@@ -233,6 +236,98 @@ fn cvdxf_data_ref_self_ref_reproduces_fixture_inner_object_data() {
         },
     );
     assert_eq!(rebuilt, object_data);
+}
+
+/// End-to-end byte-parity for CNotaryEvidence framing.
+///
+/// The fixture's `rawTx` contains an `EVAL_NOTARY_EVIDENCE` data-deposit
+/// output whose scriptPubKey wraps a serialized `CNotaryEvidence`. We
+/// locate that serialization inside the raw tx (by searching for its
+/// fixed prefix), extract the systemID + inner CEvidenceData dataVec,
+/// then reconstruct the CNotaryEvidence with our writer and assert
+/// byte-exact equality against the real bytes.
+///
+/// This proves the entire framing stack — CNotaryEvidence, CCrossChainProof,
+/// CChainObject header, and CEvidenceData (including the double-VARINT-version
+/// quirk) — matches the daemon byte-for-byte. What is *not* proven at this
+/// layer is the surrounding CryptoCondition script wrapping; that lands
+/// with the EVAL_NOTARY_EVIDENCE CC-script slice.
+#[test]
+fn notary_evidence_reproduces_fixture_data_deposit_payload_byte_for_byte() {
+    let raw = include_str!("fixtures/t1_578528.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let raw_tx = hex::decode(fixture["rawTx"].as_str().unwrap()).unwrap();
+
+    // Locate the CNotaryEvidence prefix: 0x01 (version) | 0x03 (TYPE_IMPORT_PROOF)
+    // | 20B systemID | 32B zero hash | 4B zero n | 0x02 (STATE_SUPPORTING).
+    // 36 consecutive zeros followed by 0x02 is a strong anchor.
+    let start = find_notary_evidence_start(&raw_tx).expect("notary evidence prefix");
+
+    let system_id: [u8; 20] = raw_tx[start + 2..start + 22].try_into().unwrap();
+
+    // The CCrossChainProof begins at start+59. version (4B LE=1) then
+    // VARINT(count). For this fixture count = 1 (payload only, no signature).
+    assert_eq!(&raw_tx[start + 59..start + 63], &[0x01, 0x00, 0x00, 0x00]);
+    assert_eq!(raw_tx[start + 63], 0x01, "one chain object");
+
+    // Chain object header (2B) at start+64; CEvidenceData at start+66.
+    assert_eq!(&raw_tx[start + 64..start + 66], &[0x0A, 0x00]);
+    let ced_offset = start + 66;
+    assert_eq!(raw_tx[ced_offset], 0x01, "CEvidenceData VARINT version #1");
+    assert_eq!(raw_tx[ced_offset + 1], 0x01, "CEvidenceData VARINT version #2 (daemon quirk)");
+    assert_eq!(raw_tx[ced_offset + 2], 0x01, "CEvidenceData VARINT type=TYPE_DATA");
+    let vdxf_offset = ced_offset + 3;
+    let vdxf_key: [u8; 20] = raw_tx[vdxf_offset..vdxf_offset + 20].try_into().unwrap();
+    assert_eq!(vdxf_key, DATA_DESCRIPTOR_KEY_LE);
+
+    // dataVec CompactSize + data. This fixture has dataVec > 252 bytes so the
+    // CompactSize is 3 bytes (0xFD + u16 LE).
+    let cs_offset = vdxf_offset + 20;
+    assert_eq!(raw_tx[cs_offset], 0xFD, "expect 3-byte CompactSize form");
+    let data_len = u16::from_le_bytes([raw_tx[cs_offset + 1], raw_tx[cs_offset + 2]]) as usize;
+    let data_start = cs_offset + 3;
+    let data_end = data_start + data_len;
+    let data_vec = &raw_tx[data_start..data_end];
+
+    // The whole CNotaryEvidence extent — everything from `start` up to and
+    // including the final dataVec byte.
+    let expected = &raw_tx[start..data_end];
+
+    let mut rebuilt = Vec::new();
+    write_notary_evidence_for_envelope(
+        &mut rebuilt,
+        &system_id,
+        &[EvidenceEntry {
+            vdxf_key: &DATA_DESCRIPTOR_KEY_LE,
+            data: data_vec,
+        }],
+    );
+    assert_eq!(rebuilt, expected);
+}
+
+fn find_notary_evidence_start(bytes: &[u8]) -> Option<usize> {
+    // Fixed pattern: 01 03 <20 bytes> <36 zero bytes> 02
+    // Total prefix length being validated: 59 bytes.
+    if bytes.len() < 59 {
+        return None;
+    }
+    for i in 0..bytes.len() - 59 {
+        if bytes[i] != 0x01 || bytes[i + 1] != 0x03 {
+            continue;
+        }
+        if bytes[i + 22..i + 58].iter().any(|&b| b != 0) {
+            continue;
+        }
+        if bytes[i + 58] != 0x02 {
+            continue;
+        }
+        // Extra sanity: CCrossChainProof version at i+59 should be 1 (u32 LE).
+        if i + 63 >= bytes.len() || &bytes[i + 59..i + 63] != [0x01, 0x00, 0x00, 0x00] {
+            continue;
+        }
+        return Some(i);
+    }
+    None
 }
 
 fn hex_to_32(s: &str) -> [u8; 32] {
