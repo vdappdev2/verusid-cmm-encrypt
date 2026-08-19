@@ -9,6 +9,7 @@ pub mod cc_script;
 pub mod crypto;
 pub mod data_descriptor;
 pub mod data_ref;
+pub mod ephemeral;
 pub mod notary_evidence;
 pub mod vdxf;
 pub mod wire;
