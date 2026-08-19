@@ -1,0 +1,29 @@
+[package]
+name = "verusid-cmm-encrypt"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Pure-Rust writer for Verus flags:13 public-decrypt cmm entries."
+repository = "https://github.com/vdappdev2/verusid-cmm-encrypt"
+readme = "README.md"
+
+[lib]
+name = "verusid_cmm_encrypt"
+path = "src/lib.rs"
+
+[dependencies]
+blake2b_simd = "1"
+chacha20poly1305 = "0.10"
+jubjub = "0.10"
+
+[dev-dependencies]
+hex = "0.4"
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[profile.release]
+opt-level = 3
