@@ -23,10 +23,12 @@
 //!
 //! What is byte-parity-tested here: DH round-trip consistency (encrypt
 //! and decrypt sides derive the same `dhsecret`), and deterministic
-//! `epk` bytes for pinned `(esk, d)` inputs. What is deferred to Phase 2
-//! (running-daemon round-trip): third-party interop confirmation that
-//! this crate's `epk` matches what `librustzcash_sapling_ka_derivepublic`
-//! produces for the same inputs.
+//! `epk` bytes for pinned `(esk, d)` inputs. Interop with
+//! `librustzcash_sapling_ka_derivepublic` is separately verified via the
+//! daemon round-trip examples under `examples/`, which feed our writer's
+//! output to a running daemon's `decryptdata` RPC and confirm plaintext
+//! recovery — the daemon accepts our `epk` values as valid subgroup
+//! points and completes the outer AEAD decrypt.
 
 use blake2s_simd::Params as Blake2sParams;
 use ff::Field;

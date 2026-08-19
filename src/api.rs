@@ -7,8 +7,9 @@
 //! crypto is done here; the caller composes the returned bytes into a
 //! v4 transaction using whatever signing stack they prefer.
 //!
-//! Scope: the public-decrypt path. `signdata`-supplied signatures and
-//! multi-value entries are out of scope. Payloads that produce an
+//! Scope: the public-decrypt path with optional `signdata`-supplied
+//! signature attachment (via [`EncryptRequest::signature`]). Multi-value
+//! cmm entries are out of scope. Payloads that produce an
 //! `EVAL_NOTARY_EVIDENCE` output larger than `MAX_SCRIPT_ELEMENT_SIZE`
 //! (6000 bytes) are transparently split across N tx outputs via
 //! `CNotaryEvidence::BreakApart` (see `notary_evidence::break_apart` and

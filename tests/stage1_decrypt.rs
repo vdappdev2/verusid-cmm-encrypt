@@ -3,9 +3,9 @@
 //! `crypto` module. Serves as the anchor regression: if any of the KDF, DH,
 //! or AEAD primitives ever drifts from the daemon, this test breaks.
 //!
-//! Fixture: `tests/fixtures/t1_578528.json` (t1@ vrsctest, height 578528).
-//! Same JSON used by `byte-parity-experiment` under
-//! `chainvue-things/flags13-writer-lib/scoping/byte-parity-experiment/`.
+//! Fixture: `tests/fixtures/t1_578528.json` (t1@ vrsctest, height 578528)
+//! — the byte-parity experiment that originally produced this crate's
+//! primitives against a live daemon-written entry.
 
 use verusid_cmm_encrypt::cc_script::write_eval_notary_evidence_script;
 use verusid_cmm_encrypt::crypto::{aead_decrypt, kdf_sapling, sapling_ka_agree};
