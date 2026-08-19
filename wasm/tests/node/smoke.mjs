@@ -4,9 +4,10 @@
 //   cd wasm && wasm-pack build --target nodejs --out-dir tests/node/pkg
 //   node wasm/tests/node/smoke.mjs
 //
-// Asserts the binding is wired end-to-end: input types accepted, output shape
-// matches the documented layout, RNG is live (two calls with identical input
-// produce different ephemeral material).
+// Asserts the binding is wired end-to-end: options-object request accepted,
+// output shape matches the documented layout, RNG is live (two calls with
+// identical input produce different ephemeral material), chunking triggers
+// above threshold, and signature attachment appends a second descriptor.
 
 import assert from "node:assert/strict";
 import { encryptPublicDecrypt } from "./pkg/verusid_cmm_encrypt_wasm.js";
@@ -15,15 +16,15 @@ const plaintext = new TextEncoder().encode("hello from node smoke test");
 const outerVdxfKey = new Uint8Array(20).fill(0xaa);
 const systemId = new Uint8Array(20).fill(0xbb);
 
-const first = encryptPublicDecrypt(
+const first = encryptPublicDecrypt({
   plaintext,
   outerVdxfKey,
   systemId,
-  null,
-  null,
-  0,
-  null,
-);
+  label: null,
+  mimeType: null,
+  dataDepositVoutIndex: 0,
+  signature: null,
+});
 
 // --- Shape checks ---
 assert.ok(first.cmmEntry, "result.cmmEntry present");
@@ -57,17 +58,53 @@ assert.equal(
   "data-deposit script byte 0 = 0x27 master push",
 );
 
-// --- Chunking: payload above ~5.7 KB threshold produces multiple scripts ---
-const bigPayload = new Uint8Array(10_000).fill(0x5a);
-const chunked = encryptPublicDecrypt(
-  bigPayload,
+// vdxfKey field echoes the caller's input verbatim
+assert.deepEqual(
+  Array.from(first.cmmEntry.vdxfKey),
+  Array.from(outerVdxfKey),
+  "cmm entry vdxfKey mirrors input",
+);
+
+// --- Optional fields absent: omitting label/mimeType/signature works ---
+const withoutOptionals = encryptPublicDecrypt({
+  plaintext,
   outerVdxfKey,
   systemId,
-  null,
-  null,
-  0,
-  null,
+  dataDepositVoutIndex: 0,
+});
+assert.equal(
+  withoutOptionals.cmmEntry.value[1],
+  0x0d,
+  "call succeeds with only required fields",
 );
+
+// --- RNG liveness: same input, different randomness → different ephemerals ---
+const second = encryptPublicDecrypt({
+  plaintext,
+  outerVdxfKey,
+  systemId,
+  label: null,
+  mimeType: null,
+  dataDepositVoutIndex: 0,
+  signature: null,
+});
+assert.notDeepEqual(
+  Array.from(first.publishedIvk),
+  Array.from(second.publishedIvk),
+  "two calls with identical input produce different published_ivk (RNG live)",
+);
+
+// --- Chunking: payload above ~5.7 KB threshold produces multiple scripts ---
+const bigPayload = new Uint8Array(10_000).fill(0x5a);
+const chunked = encryptPublicDecrypt({
+  plaintext: bigPayload,
+  outerVdxfKey,
+  systemId,
+  label: null,
+  mimeType: null,
+  dataDepositVoutIndex: 0,
+  signature: null,
+});
 assert.ok(
   chunked.dataDepositOutputScripts.length >= 2,
   `10 KB payload must produce >=2 scripts (got ${chunked.dataDepositOutputScripts.length})`,
@@ -80,41 +117,18 @@ for (const script of chunked.dataDepositOutputScripts) {
   );
 }
 
-// vdxfKey field echoes the caller's input verbatim
-assert.deepEqual(
-  Array.from(first.cmmEntry.vdxfKey),
-  Array.from(outerVdxfKey),
-  "cmm entry vdxfKey mirrors input",
-);
-
-// --- RNG liveness: same input, different randomness → different ephemerals ---
-const second = encryptPublicDecrypt(
-  plaintext,
-  outerVdxfKey,
-  systemId,
-  null,
-  null,
-  0,
-  null,
-);
-assert.notDeepEqual(
-  Array.from(first.publishedIvk),
-  Array.from(second.publishedIvk),
-  "two calls with identical input produce different published_ivk (RNG live)",
-);
-
 // --- Signature attachment: passing a signature appends a second descriptor
-//     to the cmm entry value, roughly doubling its length ---
+//     to the cmm entry value ---
 const sigBytes = new TextEncoder().encode("caller-supplied signature blob");
-const signed = encryptPublicDecrypt(
+const signed = encryptPublicDecrypt({
   plaintext,
   outerVdxfKey,
   systemId,
-  null,
-  null,
-  0,
-  sigBytes,
-);
+  label: null,
+  mimeType: null,
+  dataDepositVoutIndex: 0,
+  signature: sigBytes,
+});
 assert.ok(
   signed.cmmEntry.value.length > first.cmmEntry.value.length,
   "signed cmm value must be larger than unsigned",
@@ -134,20 +148,45 @@ assert.equal(
   "second descriptor flags = 13",
 );
 
-// --- Error path: wrong-length key rejected with a JS Error ---
+// --- Error paths ---
+
+// Wrong-length outerVdxfKey rejected.
 assert.throws(
   () =>
-    encryptPublicDecrypt(
+    encryptPublicDecrypt({
       plaintext,
-      new Uint8Array(19),
+      outerVdxfKey: new Uint8Array(19),
       systemId,
-      null,
-      null,
-      0,
-      null,
-    ),
+      dataDepositVoutIndex: 0,
+    }),
   /outerVdxfKey must be exactly 20 bytes/,
   "19-byte outerVdxfKey rejected",
+);
+
+// Missing required field rejected.
+assert.throws(
+  () =>
+    encryptPublicDecrypt({
+      plaintext,
+      outerVdxfKey,
+      // systemId omitted
+      dataDepositVoutIndex: 0,
+    }),
+  /systemId is required/,
+  "missing systemId rejected",
+);
+
+// Wrong type on a required field rejected.
+assert.throws(
+  () =>
+    encryptPublicDecrypt({
+      plaintext,
+      outerVdxfKey,
+      systemId,
+      dataDepositVoutIndex: -1,
+    }),
+  /dataDepositVoutIndex must be a non-negative integer/,
+  "negative dataDepositVoutIndex rejected",
 );
 
 console.log("smoke.mjs: OK");

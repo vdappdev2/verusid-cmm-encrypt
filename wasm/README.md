@@ -23,28 +23,38 @@ smoke test builds into `tests/node/pkg/`.
 ```js
 import { encryptPublicDecrypt } from "verusid-cmm-encrypt-wasm";
 
-const result = encryptPublicDecrypt(
-  plaintextBytes,        // Uint8Array
+const result = encryptPublicDecrypt({
+  plaintext,             // Uint8Array
   outerVdxfKey,          // Uint8Array, exactly 20 bytes (LE from getvdxfid)
   systemId,              // Uint8Array, exactly 20 bytes (LE ASSETCHAINS_CHAINID)
-  label,                 // string | null
-  mimeType,              // string | null
-  dataDepositVoutIndex,  // number, u32 — index the first deposit output will occupy
-  signature,             // Uint8Array | null — optional caller-supplied signature
-                         //   to attach as a second cmm descriptor
-);
+  label,                 // string | null (optional)
+  mimeType,              // string | null (optional)
+  dataDepositVoutIndex,  // number, u32 — index the first deposit output occupies
+  signature,             // Uint8Array | null (optional) — caller-supplied
+                         //   signature attached as a second cmm descriptor
+});
 
 // {
 //   cmmEntry: { vdxfKey: Uint8Array, value: Uint8Array },
-//   dataDepositOutputScripts: Array<Uint8Array>,   // 1 element normally; N
-//                                                  // when payload triggers
-//                                                  // BreakApart chunking
-//   publishedIvk: Uint8Array,                      // one key decrypts data
-//                                                  // AND signature descriptors
+//   dataDepositOutputScripts: Uint8Array[],   // 1 element normally; N when
+//                                             // payload triggers BreakApart
+//                                             // chunking
+//   publishedIvk: Uint8Array,                 // one key decrypts data AND
+//                                             // signature descriptors
 //   outerEpk: Uint8Array,
 //   ephemeralDiversifier: Uint8Array,
 //   ephemeralPkD: Uint8Array,
 // }
+```
+
+TypeScript users import the request and result interfaces directly:
+
+```ts
+import {
+  encryptPublicDecrypt,
+  type EncryptPublicDecryptRequest,
+  type EncryptPublicDecryptResult,
+} from "verusid-cmm-encrypt-wasm";
 ```
 
 Each element of `dataDepositOutputScripts` is a full `scriptPubKey` for an
