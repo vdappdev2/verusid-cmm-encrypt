@@ -7,6 +7,7 @@
 //! Same JSON used by `byte-parity-experiment` under
 //! `chainvue-things/flags13-writer-lib/scoping/byte-parity-experiment/`.
 
+use verusid_cmm_encrypt::cc_script::write_eval_notary_evidence_script;
 use verusid_cmm_encrypt::crypto::{aead_decrypt, kdf_sapling, sapling_ka_agree};
 use verusid_cmm_encrypt::data_descriptor::{
     wrap_encrypted_with_key, write_data_descriptor, DataDescriptor,
@@ -303,6 +304,58 @@ fn notary_evidence_reproduces_fixture_data_deposit_payload_byte_for_byte() {
         }],
     );
     assert_eq!(rebuilt, expected);
+}
+
+/// End-to-end byte-parity for the full EVAL_NOTARY_EVIDENCE data-deposit
+/// scriptPubKey. Extract the vout[0] scriptPubKey bytes from the fixture's
+/// rawTx (bounded by the CNotaryEvidence prefix search + the known
+/// vout-record structure) and assert that
+/// `write_eval_notary_evidence_script(&notary_evidence_bytes)` reproduces
+/// them byte-for-byte.
+///
+/// This closes the loop from raw CNotaryEvidence bytes to the actual
+/// on-chain scriptPubKey. Combined with the WrapEncrypted byte-parity
+/// test, everything from the AEAD ciphertext through to the transparent
+/// output script is now anchored against a real daemon-written entry.
+#[test]
+fn eval_notary_evidence_script_reproduces_fixture_vout0_script_pubkey() {
+    let raw = include_str!("fixtures/t1_578528.json");
+    let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let raw_tx = hex::decode(fixture["rawTx"].as_str().unwrap()).unwrap();
+
+    // Locate CNotaryEvidence within the raw tx (same anchor as the
+    // notary_evidence test).
+    let ne_start = find_notary_evidence_start(&raw_tx).expect("CNotaryEvidence prefix");
+    // Same-shape parse to compute NotaryEvidence length.
+    let ced_offset = ne_start + 66;
+    let vdxf_offset = ced_offset + 3;
+    let cs_offset = vdxf_offset + 20;
+    assert_eq!(raw_tx[cs_offset], 0xFD);
+    let data_len = u16::from_le_bytes([raw_tx[cs_offset + 1], raw_tx[cs_offset + 2]]) as usize;
+    let ne_end = cs_offset + 3 + data_len;
+    let notary_evidence = &raw_tx[ne_start..ne_end];
+
+    // Locate vout[0] scriptPubKey. The scriptPubKey wraps ne_start; the
+    // outer push prefix (OP_PUSHDATA2 + u16 LE length) precedes ne_start
+    // by 3 bytes, and the vParams inner starts 5 (header push) + 34
+    // (pubkey push) = 39 bytes before ne_start's push prefix. Then a
+    // 3-byte vParams outer push prefix, an OP_CHECKCRYPTOCONDITION (1B),
+    // and a 40-byte masterParams push precede that.
+    //
+    // Rather than reverse-count offsets, use the fact that the vout[0]
+    // scriptPubKey is 447 bytes for this fixture and ends 1 byte after
+    // the NotaryEvidence (OP_DROP). So:
+    //   script_end = ne_end + 1
+    //   script_start = script_end - 447
+    let script_end = ne_end + 1;
+    let script_start = script_end - 447;
+    let expected_script = &raw_tx[script_start..script_end];
+    assert_eq!(expected_script.last(), Some(&0x75), "OP_DROP at end");
+
+    let mut rebuilt = Vec::new();
+    write_eval_notary_evidence_script(&mut rebuilt, notary_evidence);
+    assert_eq!(rebuilt.len(), expected_script.len());
+    assert_eq!(rebuilt, expected_script);
 }
 
 fn find_notary_evidence_start(bytes: &[u8]) -> Option<usize> {
