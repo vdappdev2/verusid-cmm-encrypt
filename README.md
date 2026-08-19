@@ -54,6 +54,25 @@ against a live `t1@` VRSCTEST entry at height 578528. See the scoping report at
 `../chainvue-things/flags13-writer-lib/scoping/scope-report.md` for the go/no-go
 analysis.
 
+## Daemon round-trip verification
+
+The outer AEAD half is additionally validated against a running daemon via
+`examples/emit_datadescriptor_json.rs`. The example generates a fresh
+`encrypt_public_decrypt` output (deterministic RNG) and prints the exact
+`datadescriptor` JSON that VerusCoin's `decryptdata` RPC accepts:
+
+```
+cargo run --example emit_datadescriptor_json
+# then feed the JSON to a running daemon:
+verus -chain=VRSCTEST decryptdata '<pasted JSON>'
+```
+
+A daemon that shares librustzcash's Sapling primitives will return a CCDR
+pointer with `output.voutnum` equal to the `data_deposit_vout_index` printed on
+stderr, and `output.txid` all zeros (envelope writes are self-refs). No wallet
+or on-chain state is required — the outer decrypt path is stateless for the
+public-decrypt shape.
+
 ## License
 
 MIT. See `LICENSE`.
