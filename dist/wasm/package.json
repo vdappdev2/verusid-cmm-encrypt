@@ -1,0 +1,17 @@
+{
+  "name": "verusid-cmm-encrypt-wasm",
+  "description": "WebAssembly bindings for verusid-cmm-encrypt.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vdappdev2/verusid-cmm-encrypt"
+  },
+  "files": [
+    "verusid_cmm_encrypt_bg.wasm",
+    "verusid_cmm_encrypt.js",
+    "verusid_cmm_encrypt.d.ts"
+  ],
+  "main": "verusid_cmm_encrypt.js",
+  "types": "verusid_cmm_encrypt.d.ts"
+}
