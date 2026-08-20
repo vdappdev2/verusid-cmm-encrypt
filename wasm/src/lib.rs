@@ -73,8 +73,12 @@ export interface EncryptPublicDecryptResult {
 
 #[wasm_bindgen]
 extern "C" {
+    /// Opaque JS-side handle for the `EncryptPublicDecryptRequest` TypeScript
+    /// interface; fields are read via [`js_sys::Reflect`] inside the binding.
     #[wasm_bindgen(typescript_type = "EncryptPublicDecryptRequest")]
     pub type JsEncryptRequest;
+    /// Opaque JS-side handle for the `EncryptPublicDecryptResult` TypeScript
+    /// interface; the binding constructs it via [`js_sys::Reflect::set`].
     #[wasm_bindgen(typescript_type = "EncryptPublicDecryptResult")]
     pub type JsEncryptResult;
 }
@@ -90,8 +94,8 @@ pub fn encrypt_public_decrypt_js(request: JsEncryptRequest) -> Result<JsEncryptR
     let request = JsValue::from(request);
 
     let plaintext = read_uint8array(&request, "plaintext")?;
-    let outer_vdxf_key = read_uint8array_of_len(&request, "outerVdxfKey", 20)?;
-    let system_id = read_uint8array_of_len(&request, "systemId", 20)?;
+    let outer_vdxf_key = read_uint8array_20b(&request, "outerVdxfKey")?;
+    let system_id = read_uint8array_20b(&request, "systemId")?;
     let label = read_optional_string(&request, "label")?;
     let mime_type = read_optional_string(&request, "mimeType")?;
     let data_deposit_vout_index = read_u32(&request, "dataDepositVoutIndex")?;
@@ -135,17 +139,14 @@ fn read_uint8array(obj: &JsValue, field: &str) -> Result<Uint8Array, JsError> {
         .map_err(|_| JsError::new(&format!("{field} must be a Uint8Array")))
 }
 
-fn read_uint8array_of_len(obj: &JsValue, field: &str, expected: usize) -> Result<[u8; 20], JsError> {
+fn read_uint8array_20b(obj: &JsValue, field: &str) -> Result<[u8; 20], JsError> {
     let arr = read_uint8array(obj, field)?;
     let len = arr.length() as usize;
-    if len != expected {
+    if len != 20 {
         return Err(JsError::new(&format!(
-            "{field} must be exactly {expected} bytes, got {len}"
+            "{field} must be exactly 20 bytes, got {len}"
         )));
     }
-    // The current callers only need 20-byte outputs; keeping the fixed-size
-    // return type avoids a heap allocation and a slice-length check downstream.
-    assert_eq!(expected, 20, "read_uint8array_of_len currently only supports 20-byte targets");
     let mut out = [0u8; 20];
     arr.copy_to(&mut out);
     Ok(out)

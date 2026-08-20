@@ -32,7 +32,6 @@
 
 use blake2s_simd::Params as Blake2sParams;
 use ff::Field;
-use group::{Group, GroupEncoding};
 use jubjub::{AffinePoint, ExtendedPoint, Fr};
 use rand_core::{CryptoRng, RngCore};
 

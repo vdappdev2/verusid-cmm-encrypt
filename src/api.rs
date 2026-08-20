@@ -16,7 +16,6 @@
 //! `block.cpp:817-842`); the daemon reassembles on read.
 
 use ff::Field;
-use group::GroupEncoding;
 use jubjub::{AffinePoint, ExtendedPoint, Fr};
 use rand_core::{CryptoRng, RngCore};
 
