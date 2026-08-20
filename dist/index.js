@@ -89,9 +89,15 @@ function normalizePlaintext(p) {
     // Reject non-plain objects (Map, Set, Promise, Date, class instances, ...)
     // which JSON.stringify silently reduces to '{}' or an ISO string instead of
     // the caller's expected structure. Only plain `{}` / `Object.create(null)`
-    // objects and arrays are accepted.
+    // objects and arrays are accepted. The `Object.getPrototypeOf(proto) === null`
+    // clause accepts plain objects from other realms (Node vm context, worker) —
+    // their prototype is a different `Object.prototype` whose own prototype is
+    // still `null`, since `Object.prototype` is the only object with a null proto.
     const proto = Object.getPrototypeOf(p);
-    if (proto !== Object.prototype && proto !== null && !Array.isArray(p)) {
+    const isPlainObject = proto === null ||
+        proto === Object.prototype ||
+        Object.getPrototypeOf(proto) === null;
+    if (!isPlainObject && !Array.isArray(p)) {
         throw new Error(`plaintext object must be a plain object or array; got ${p.constructor?.name ?? 'unknown'}`);
     }
     return new TextEncoder().encode(JSON.stringify(p));
