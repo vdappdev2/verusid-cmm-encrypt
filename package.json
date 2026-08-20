@@ -13,7 +13,7 @@
   },
   "files": ["dist", "src", "README.md", "LICENSE"],
   "scripts": {
-    "build:wasm": "cd wasm && RUSTFLAGS=\"--remap-path-prefix=$HOME=/home --remap-path-prefix=$OLDPWD=/proj\" wasm-pack build --target nodejs --release --out-dir ../src/wasm --out-name verusid_cmm_encrypt",
+    "build:wasm": "cd wasm && RUSTFLAGS=\"--remap-path-prefix=$(cd \"$HOME\" && pwd -P)=/home --remap-path-prefix=$(cd .. && pwd -P)=/proj\" wasm-pack build --target nodejs --release --out-dir ../src/wasm --out-name verusid_cmm_encrypt",
     "build:ts": "tsc",
     "build:copy-wasm": "mkdir -p dist/wasm && cp src/wasm/verusid_cmm_encrypt.js src/wasm/verusid_cmm_encrypt.d.ts src/wasm/verusid_cmm_encrypt_bg.wasm src/wasm/verusid_cmm_encrypt_bg.wasm.d.ts src/wasm/package.json dist/wasm/",
     "build": "yarn build:ts && yarn build:copy-wasm",

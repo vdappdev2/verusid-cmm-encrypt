@@ -100,6 +100,13 @@ function normalizePlaintext(p) {
     if (!isPlainObject && !Array.isArray(p)) {
         throw new Error(`plaintext object must be a plain object or array; got ${p.constructor?.name ?? 'unknown'}`);
     }
+    // Own toJSON() would silently replace the payload during JSON.stringify;
+    // the encrypted bytes would be the return value of toJSON(), not the
+    // caller's object. Nested toJSON on child values is not guarded.
+    if (Object.hasOwn(p, 'toJSON') &&
+        typeof p.toJSON === 'function') {
+        throw new Error('plaintext object must not define a toJSON() method — it would silently transform the payload before encryption');
+    }
     return new TextEncoder().encode(JSON.stringify(p));
 }
 function toUint8Array(b) {
