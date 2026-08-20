@@ -17,8 +17,9 @@
     "build:ts": "tsc",
     "build:copy-wasm": "mkdir -p dist/wasm && cp src/wasm/verusid_cmm_encrypt.js src/wasm/verusid_cmm_encrypt.d.ts src/wasm/verusid_cmm_encrypt_bg.wasm src/wasm/verusid_cmm_encrypt_bg.wasm.d.ts src/wasm/package.json dist/wasm/",
     "build": "yarn build:ts && yarn build:copy-wasm",
-    "test": "yarn build && node --test test/*.test.mjs",
-    "test:rust": "cd rust && cargo test --release"
+    "test": "yarn build:wasm && yarn build && node --test test/*.test.mjs",
+    "test:rust": "cd rust && cargo test --release",
+    "prepublishOnly": "yarn build:wasm && yarn build"
   },
   "engines": {
     "node": ">=20.0.0"

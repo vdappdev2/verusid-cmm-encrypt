@@ -176,17 +176,21 @@ export function encryptDescriptor(
 function normalizePlaintext(
   p: string | Uint8Array | Buffer | object,
 ): Uint8Array {
+  if (p === null || p === undefined) {
+    throw new Error('plaintext must not be null or undefined');
+  }
   if (Buffer.isBuffer(p)) return new Uint8Array(p);
   if (p instanceof Uint8Array) return p;
   if (typeof p === 'string') return new TextEncoder().encode(p);
-  // object: JSON.stringify → UTF-8. Falls through if p is null/undefined,
-  // which JSON.stringify turns into "null" / undefined respectively.
   return new TextEncoder().encode(JSON.stringify(p));
 }
 
 function toUint8Array(b: Buffer | Uint8Array): Uint8Array {
   if (Buffer.isBuffer(b)) return new Uint8Array(b);
-  return b;
+  if (b instanceof Uint8Array) return b;
+  throw new Error(
+    `signature must be a Buffer or Uint8Array; got ${typeof b}`,
+  );
 }
 
 /**
