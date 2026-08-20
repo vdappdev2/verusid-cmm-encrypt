@@ -16,7 +16,8 @@ wasm-pack build --target nodejs   # or --target web / --target bundler
 ```
 
 Produces a JS/TS package under `pkg/` (or `--out-dir` if overridden). The
-smoke test builds into `tests/node/pkg/`.
+TypeScript wrapper at the repo root builds into `../src/wasm/` via
+`yarn build:wasm`.
 
 ## JS usage
 
@@ -72,28 +73,27 @@ payloads.
 ## Testing
 
 Rust host build (`cargo build`) compiles the `rlib` half; behavior of the
-compiled Wasm module is verified from JavaScript.
+compiled Wasm module is verified from JavaScript through the TypeScript
+wrapper's Node test suite at the repo root.
 
 ```
-cd wasm
-wasm-pack build --target nodejs --out-dir tests/node/pkg
-node tests/node/smoke.mjs
+yarn build:wasm && yarn build
+node --test test/*.test.mjs
 ```
 
-The smoke test covers shape (Uint8Array fields with expected lengths), the
-documented `flags:13` byte layout (`0x01 0x0D` header, `0x27` master push on
-the deposit script), RNG liveness (two calls with identical input diverge),
-chunking (a 10 KB payload produces multiple sub-6000-byte scripts), and
-signature attachment (the signed cmm value is larger than the unsigned one
-and its second descriptor starts with the flags:13 header at the correct
-offset).
+The wrapper suite covers wasm boot (produces the documented `flags:13` byte
+layout — `0x01 0x0D` header, `0x27` master push on the deposit script), RNG
+liveness (two calls with identical input diverge), chunking (a 10 KB payload
+produces multiple sub-6000-byte scripts), and signature attachment (the
+signed cmm value is larger than the unsigned one and its second descriptor
+starts with the flags:13 header at the correct offset).
 
 ## Byte-parity
 
 Every cryptographic and framing byte this binding emits is produced by the
 parent crate, which is byte-parity-anchored against a real daemon-written
-`flags:13` entry (`t1@` VRSCTEST, height 578528). See [`../README.md`](../README.md)
-and [`../tests/stage1_decrypt.rs`](../tests/stage1_decrypt.rs) for the fixture
+`flags:13` entry (`t1@` VRSCTEST, height 578528). See [`../rust/README.md`](../rust/README.md)
+and [`../rust/tests/stage1_decrypt.rs`](../rust/tests/stage1_decrypt.rs) for the fixture
 tests.
 
 ## License

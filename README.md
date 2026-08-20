@@ -6,7 +6,7 @@ WASM-Sapling AEAD over a pure-Rust core; produces bytes-in / bytes-out that a
 caller composes into an `updateidentity` transaction.
 
 Byte-parity anchored against the daemon's write path
-([VerusCoin `pbaasrpc.cpp:16042-16424`](https://github.com/VerusCoin/VerusCoin/blob/master/src/rpc/pbaasrpc.cpp))
+([VerusCoin `pbaasrpc.cpp:16042-16424`](https://github.com/VerusCoin/VerusCoin/blob/d1df9b7d254aacbc12070da48640edf84312200b/src/rpc/pbaasrpc.cpp))
 and cross-checked against a live daemon via `decryptdata`. Feature-complete for
 the public-decrypt path: chunking (`CNotaryEvidence::BreakApart`), signdata
 `SignatureDataKey` attachment, and payloads of arbitrary size.
