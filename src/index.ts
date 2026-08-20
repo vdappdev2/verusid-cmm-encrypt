@@ -196,6 +196,16 @@ function normalizePlaintext(
       `plaintext binary input must be a Buffer or Uint8Array; got ${(p as object).constructor.name}`,
     );
   }
+  // Reject non-plain objects (Map, Set, Promise, Date, class instances, ...)
+  // which JSON.stringify silently reduces to '{}' or an ISO string instead of
+  // the caller's expected structure. Only plain `{}` / `Object.create(null)`
+  // objects and arrays are accepted.
+  const proto = Object.getPrototypeOf(p);
+  if (proto !== Object.prototype && proto !== null && !Array.isArray(p)) {
+    throw new Error(
+      `plaintext object must be a plain object or array; got ${(p as object).constructor?.name ?? 'unknown'}`,
+    );
+  }
   return new TextEncoder().encode(JSON.stringify(p));
 }
 
