@@ -76,6 +76,16 @@ function normalizePlaintext(p) {
         return p;
     if (typeof p === 'string')
         return new TextEncoder().encode(p);
+    if (typeof p !== 'object') {
+        throw new Error(`plaintext must be a string, Buffer/Uint8Array, or object; got ${typeof p}`);
+    }
+    // Reject byte-adjacent views (Int8Array, DataView, ArrayBuffer, ...) that
+    // would otherwise silently JSON.stringify to '{}' or '{"0":1,...}' instead
+    // of being treated as raw bytes. Callers passing binary must use Buffer or
+    // Uint8Array explicitly.
+    if (ArrayBuffer.isView(p) || p instanceof ArrayBuffer) {
+        throw new Error(`plaintext binary input must be a Buffer or Uint8Array; got ${p.constructor.name}`);
+    }
     return new TextEncoder().encode(JSON.stringify(p));
 }
 function toUint8Array(b) {

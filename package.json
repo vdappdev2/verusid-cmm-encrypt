@@ -19,7 +19,7 @@
     "build": "yarn build:ts && yarn build:copy-wasm",
     "test": "yarn build:wasm && yarn build && node --test test/*.test.mjs",
     "test:rust": "cd rust && cargo test --release",
-    "prepublishOnly": "yarn build:wasm && yarn build"
+    "prepublishOnly": "yarn build:wasm && yarn build && git diff --exit-code -- dist/"
   },
   "engines": {
     "node": ">=20.0.0"
