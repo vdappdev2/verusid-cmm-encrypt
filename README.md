@@ -1,95 +1,134 @@
 # verusid-cmm-encrypt
 
-Pure-Rust writer library for Verus identity **content-multimap** entries in the
-`flags:13` public-decrypt envelope shape.
+Write Verus identity **content-multimap** entries in the `flags:13`
+public-decrypt envelope shape from TypeScript / JavaScript. TS wrapper +
+WASM-Sapling AEAD over a pure-Rust core; produces bytes-in / bytes-out that a
+caller composes into an `updateidentity` transaction.
 
-Status: feature-complete for the public-decrypt path. 84 unit + 7 fixture
-byte-parity tests pass. Every framing layer is anchored against a live
-daemon-written entry byte-for-byte; the outer AEAD path is additionally
-verified end-to-end against a running daemon via `decryptdata`. Chunking
-(payloads larger than a single tx output can hold) and `signdata`
-SignatureDataKey attachment are both supported and daemon-verified.
+Byte-parity anchored against the daemon's write path
+([VerusCoin `pbaasrpc.cpp:16042-16424`](https://github.com/VerusCoin/VerusCoin/blob/master/src/rpc/pbaasrpc.cpp))
+and cross-checked against a live daemon via `decryptdata`. Feature-complete for
+the public-decrypt path: chunking (`CNotaryEvidence::BreakApart`), signdata
+`SignatureDataKey` attachment, and payloads of arbitrary size.
 
-WebAssembly bindings live in [`wasm/`](wasm) and expose the same API to
-JavaScript.
+## Installation
 
-## What it does
+Pin to a specific commit SHA, matching the sibling
+[`verusid-cmm-decrypt`](https://github.com/vdappdev2/verusid-cmm-decrypt)
+package:
 
-Given a plaintext payload, an outer VDXF key, and (optionally) a caller-
-supplied signature, produce the byte artifacts a caller needs to compose a
-`flags:13` `updateidentity` transaction:
+```json
+{
+  "dependencies": {
+    "verusid-cmm-encrypt": "git+https://github.com/vdappdev2/verusid-cmm-encrypt.git#<commit-sha>"
+  }
+}
+```
 
-1. The **cmm entry bytes** — one encrypted outer `CVDXFDataDescriptor` to
-   insert into `Identity.content_multimap` under the caller's chosen VDXF
-   key. When a signature is attached, the entry is a second descriptor
-   appended to the first: `sub_object = 1`, `label = "signature"`,
-   `mime = "application/json"` (matches `pbaasrpc.cpp:16380-16394`).
-2. The **data-deposit transaction outputs** — one `EVAL_NOTARY_EVIDENCE`
-   transparent output per chunk. Payloads that fit in a single output
-   (~5.7 KB effective ceiling) produce one output; larger payloads auto-chunk
-   via a byte-exact port of `CNotaryEvidence::BreakApart`
-   (`block.cpp:817-842`). All outputs have `nValue = 0`.
+Node.js ≥ 20. No Rust toolchain required — the WASM artifact is checked into
+`dist/` so `yarn add` / `npm install` gives you a ready-to-import package.
 
-The library is bytes-in / bytes-out. It has no dependency on any specific
-tx-builder crate and does not sign, submit, or wallet-manage anything.
-Consumers compose the returned artifacts into an `updateidentity` transaction
-using whatever signing stack they already have.
+## Usage
+
+```typescript
+import { encryptDescriptor } from 'verusid-cmm-encrypt';
+
+const result = encryptDescriptor({
+  plaintext: { message: 'hello world', ts: Date.now() },
+  outerVdxfKey: 'a4ad4638eb96fb16c1a7d3e3cea86bcb7a243ace112286e1f4a64481a34c4100',
+  systemId: 'a6ef9ea235635e328124ff3429db9f9e91b64e2d',
+  label: 'user_profile',
+  dataDepositVoutIndex: 0,
+});
+
+// result.cmmEntry: { vdxfKey: Buffer, value: Buffer }
+//   → push into Identity.content_multimap
+// result.dataDepositOutputScripts: Buffer[]
+//   → add each as an EVAL_NOTARY_EVIDENCE transparent output (nValue = 0),
+//     contiguously, starting at dataDepositVoutIndex
+// result.publishedIvk: Buffer
+//   → the 32-byte ivk published on-chain; anyone with it can decrypt
+```
+
+Full input shape:
+
+```typescript
+type EncryptDescriptorInput = {
+  plaintext: string | Uint8Array | Buffer | object;
+  // 20-byte binary (LE wire) OR 40-char hex (BE display, from getvdxfid)
+  outerVdxfKey: Buffer | Uint8Array | string;
+  // 20-byte binary (LE wire) OR 40-char hex (BE display, from getcurrency)
+  systemId: Buffer | Uint8Array | string;
+  label?: string | null;                   // ≤ 64 UTF-8 bytes, optional
+  mimeType?: string | null;                // ≤ 128 bytes, optional
+  dataDepositVoutIndex: number;            // u32
+  signature?: Buffer | Uint8Array | null;  // optional attached signature
+};
+```
+
+Full output shape:
+
+```typescript
+type EncryptDescriptorOutput = {
+  cmmEntry: { vdxfKey: Buffer; value: Buffer };
+  dataDepositOutputScripts: Buffer[];  // 1 normally, N when chunking triggers
+  publishedIvk: Buffer;
+  outerEpk: Buffer;
+  ephemeralDiversifier: Buffer;
+  ephemeralPkD: Buffer;
+};
+```
+
+### Chunking
+
+Payloads that produce an `EVAL_NOTARY_EVIDENCE` script larger than 6000 bytes
+(≈ 5.7 KB plaintext, after envelope overhead) are transparently split across
+multiple tx outputs via a byte-exact port of `CNotaryEvidence::BreakApart`
+(`block.cpp:817-842`). `dataDepositOutputScripts.length` reflects the chunk
+count; add all outputs contiguously starting at `dataDepositVoutIndex`. The
+daemon reader walks MULTIPART outputs and reassembles on retrieval.
+
+### Signature attachment
+
+When you pass `signature`, the encrypt path emits a second
+`CVDXFDataDescriptor` appended to the cmm entry value with
+`sub_object = 1`, `label = "signature"`, `mime = "application/json"` (matches
+the daemon's `signdata` output at `pbaasrpc.cpp:16380-16394`). Both
+descriptors are encrypted to the same published IVK — one key decrypts both.
+
+Producing the signature bytes themselves is out of scope. Typical sources:
+the daemon's `signdata` RPC, or an offline `CVDXFSignatureData` composition.
 
 ## What it does not do
 
 - Not a wallet. No key storage, no fee estimation, no broadcast.
 - Not a tx builder. Consumers wire the outputs into a v4 transaction themselves.
-- Not a Sapling-address encryption path. Only the `flags:13` public-decrypt
-  shape is supported — the ivk is published in-band so anyone reading the
-  chain can decrypt.
-- Does not produce signatures. Callers assemble signature bytes externally
-  (e.g., via the daemon's `signdata` RPC or an offline `CVDXFSignatureData`
-  composition) and pass them in via the `signature` field.
+- Not a Sapling-address encryption path. Only `flags:13` public-decrypt with
+  in-band ivk.
+- Does not produce signatures. Callers assemble signatures externally.
 
-## Byte-parity guarantee
+## Rust API
 
-The correctness gate is byte-parity against
-[VerusCoin](https://github.com/VerusCoin/VerusCoin) `updateidentity {data:{}}`
-envelope writes. Reference at commit
-`d1df9b7d254aacbc12070da48640edf84312200b` (2026-07-31). Every cryptographic
-primitive is a direct pure-Rust equivalent of what the daemon calls:
+The pure-Rust crate at [`rust/`](rust) is also usable directly, without the
+TypeScript wrapper or WASM. See [`rust/README.md`](rust/README.md) for the
+Rust-focused documentation, including byte-parity guarantees, the daemon
+round-trip verification examples, and the layered API.
 
-| Daemon | This crate |
-|---|---|
-| `librustzcash_sapling_ka_agree` | `jubjub` scalar mult |
-| `librustzcash_sapling_ka_derivepublic` | `jubjub` scalar mult |
-| `KDF_Sapling` (Blake2b-256, `"Zcash_SaplingKDF"` personalization) | `blake2b_simd` |
-| `crypto_aead_chacha20poly1305_ietf_encrypt` (zero nonce, no AAD) | `chacha20poly1305::ChaCha20Poly1305` |
+## Testing
 
-Byte-parity is proven by seven anchor tests in `tests/stage1_decrypt.rs` that
-extract the corresponding bytes from a live VRSCTEST envelope entry at height
-578528 (fixture at `tests/fixtures/t1_578528.json`) and reserialize them via
-our writer, asserting byte-exact equality at every framing layer.
-
-## Daemon round-trip verification
-
-The outer AEAD half is additionally validated against a running daemon. Two
-examples emit the exact `datadescriptor` JSON that VerusCoin's `decryptdata`
-RPC accepts:
+TypeScript wrapper (private tests, run locally):
 
 ```
-cargo run --example emit_datadescriptor_json           # data-only round-trip
-cargo run --example emit_signed_datadescriptors_json   # data + signature round-trip
+yarn build:wasm && yarn build
+node --test test/*.test.mjs
 ```
 
-Then feed each block to a running daemon:
+Rust crate:
 
 ```
-verus -chain=VRSCTEST decryptdata '<pasted JSON>'
+yarn test:rust           # or: cd rust && cargo test
 ```
-
-A daemon that shares librustzcash's Sapling primitives returns a CCDR pointer
-with `output.voutnum` matching the requested `data_deposit_vout_index`, self-
-ref `output.txid` (envelope writes always self-refer), and `subobject = 0`
-for the data descriptor / `subobject = 1` for the signature descriptor. No
-wallet or on-chain state required — the outer decrypt path is stateless for
-the public-decrypt shape.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [`LICENSE`](LICENSE).
